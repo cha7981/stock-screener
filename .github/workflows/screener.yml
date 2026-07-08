@@ -2,20 +2,42 @@ name: Minervini Auto Screener
 
 on:
   schedule:
-    - cron: '30 23 * * *'
+    # 한국시간 화~토 06:30 실행
+    # GitHub Actions cron은 UTC 기준입니다.
+    # 21:30 UTC = 한국시간 다음날 06:30
+    # 미국 월~금 정규장 종료 후 실행됩니다.
+    - cron: '30 21 * * 1-5'
+
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minervini-auto-screener
+  cancel-in-progress: true
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Seoul
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
+          cache: 'pip'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
       - name: Install dependencies
         run: pip install yfinance pandas requests lxml beautifulsoup4 html5lib
@@ -25,3 +47,20 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python screener.py
+
+      - name: Upload result CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minervini-result
+          path: "*.csv"
+
+      - name: Notify failure
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"❌ Minervini Screener GitHub Actions 실행 실패\"}"
