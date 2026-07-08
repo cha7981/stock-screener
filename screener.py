@@ -6,7 +6,6 @@ import io
 import csv
 import re
 import random
-from datetime import datetime
 import pandas as pd
 import requests
 import yfinance as yf
@@ -15,39 +14,87 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 # ============================================================
-# Minervini / Screener settings
+# V8 핵심 설정
 # ============================================================
-MIN_RS_RATING = 70
+# 너무 Severe 하지 않도록 기본값은 BALANCED입니다.
+# STRICT_MODE=True로 바꾸면 더 정석 VCP에 가까워지지만 후보가 크게 줄 수 있습니다.
+STRICT_MODE = False
+
+# Trend Template
+MIN_RS_RATING_BALANCED = 80
+MIN_RS_RATING_STRICT = 90
+MIN_PRICE = 5.0
 MIN_AVG_VOLUME = 150000
 MIN_DOLLAR_VOLUME = 2000000
+HIGH_52W_NEAR_BALANCED = 0.85   # 현재가가 52주 고점의 85% 이상
+HIGH_52W_NEAR_STRICT = 0.90     # 현재가가 52주 고점의 90% 이상
+
+# Fundamentals
 MIN_EPS_GROWTH = 0.20
 MIN_REV_GROWTH = 0.15
-MAX_RISK_PCT = 8.0
-PIVOT_NEAR_PCT = 5.0
-VCP_MAX_LAST_CONTRACTION = 0.08
-MIN_PRICE = 5.0
+MAX_FUNDAMENTAL_CALLS = 40
+FUNDAMENTAL_SLEEP = 3
+FUNDAMENTAL_RETRY_SLEEP = 45
 
+# VCP Balanced / Strict thresholds
+VCP_LAST_CONTRACTION_BALANCED = 0.07    # 마지막 수축폭 7% 이하
+VCP_LAST_CONTRACTION_STRICT = 0.05      # 마지막 수축폭 5% 이하
+VCP_CONTRACTION_RATIO_BALANCED = 0.85   # r2 <= r1*0.85, r3 <= r2*0.85
+VCP_CONTRACTION_RATIO_STRICT = 0.75
+VOLUME_DRYUP_BALANCED = 0.85            # 최근 거래량 <= 초기 거래량 85%
+VOLUME_DRYUP_STRICT = 0.70
+ATR_DRYUP_BALANCED = 0.90               # ATR10 <= ATR30*0.90
+ATR_DRYUP_STRICT = 0.70
+MAX_RISK_BALANCED = 8.0
+MAX_RISK_STRICT = 6.0
+PIVOT_NEAR_PCT_BALANCED = 6.0
+PIVOT_NEAR_PCT_STRICT = 4.0
+MIN_VCP_SCORE_BALANCED = 6              # 8점 만점 중 6점 이상
+MIN_VCP_SCORE_STRICT = 7                # 8점 만점 중 7점 이상
+
+# Download stability
 PRICE_PERIOD = "18mo"
 CHUNK_SIZE = 50
 SLEEP_BETWEEN_CHUNKS = 8
-FUNDAMENTAL_SLEEP = 3
-FUNDAMENTAL_RETRY_SLEEP = 45
-MAX_FUNDAMENTAL_CALLS = 40
 MARKET_FILTER_ENABLED = False
 
 REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/csv,application/csv,text/plain,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 
+def cfg():
+    if STRICT_MODE:
+        return {
+            "rs": MIN_RS_RATING_STRICT,
+            "high52": HIGH_52W_NEAR_STRICT,
+            "last_contraction": VCP_LAST_CONTRACTION_STRICT,
+            "contraction_ratio": VCP_CONTRACTION_RATIO_STRICT,
+            "volume_dryup": VOLUME_DRYUP_STRICT,
+            "atr_dryup": ATR_DRYUP_STRICT,
+            "max_risk": MAX_RISK_STRICT,
+            "pivot_near": PIVOT_NEAR_PCT_STRICT,
+            "min_vcp_score": MIN_VCP_SCORE_STRICT,
+            "mode": "STRICT",
+        }
+    return {
+        "rs": MIN_RS_RATING_BALANCED,
+        "high52": HIGH_52W_NEAR_BALANCED,
+        "last_contraction": VCP_LAST_CONTRACTION_BALANCED,
+        "contraction_ratio": VCP_CONTRACTION_RATIO_BALANCED,
+        "volume_dryup": VOLUME_DRYUP_BALANCED,
+        "atr_dryup": ATR_DRYUP_BALANCED,
+        "max_risk": MAX_RISK_BALANCED,
+        "pivot_near": PIVOT_NEAR_PCT_BALANCED,
+        "min_vcp_score": MIN_VCP_SCORE_BALANCED,
+        "mode": "BALANCED",
+    }
+
+
 # ============================================================
-# Telegram
+# Common utilities
 # ============================================================
 def send_telegram_message(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -62,28 +109,21 @@ def send_telegram_message(message):
         print(f"⚠️ 텔레그램 전송 에러: {e}")
 
 
-# ============================================================
-# Ticker utilities
-# ============================================================
 def clean_ticker(ticker):
     if ticker is None:
         return ""
-    ticker = str(ticker).strip().replace("\ufeff", "").replace('"', "")
-    ticker = ticker.replace("/", "-").replace(".", "-")
-    return ticker.upper()
+    return str(ticker).strip().replace("\ufeff", "").replace('"', "").replace("/", "-").replace(".", "-").upper()
 
 
 def is_valid_us_ticker(ticker):
     ticker = clean_ticker(ticker)
     if not ticker:
         return False
-    bad_values = {"CASH", "USD", "-", "N/A", "VALUE", "TICKER", "SYMBOL", "NO", "CONSTITUENTS"}
-    if ticker.upper() in bad_values:
+    if ticker in {"CASH", "USD", "-", "N/A", "VALUE", "TICKER", "SYMBOL", "NO", "CONSTITUENTS"}:
         return False
     if " " in ticker or len(ticker) > 8:
         return False
-    bad_suffixes = ("-TO", "-OL", "-DE", "-L", "-PA", "-AS", "-SW", "-VI", "-F")
-    if ticker.endswith(bad_suffixes):
+    if ticker.endswith(("-TO", "-OL", "-DE", "-L", "-PA", "-AS", "-SW", "-VI", "-F")):
         return False
     if ticker.startswith("RTY") or ticker.startswith("RTYM"):
         return False
@@ -96,55 +136,22 @@ def is_probably_common_stock(name):
     if not name:
         return True
     n = str(name).lower()
-    bad_keywords = [
+    bad = [
         " etf", "exchange traded fund", "etn", "exchange traded note",
         "warrant", "right", "unit", "preferred", "preference",
         "depositary share", "depositary shares", "note due", "notes due",
         "bond", "debenture", "income fund", "closed end fund",
         "preferred stock", "preferred shares"
     ]
-    return not any(k in n for k in bad_keywords)
+    return not any(x in n for x in bad)
 
 
-# ============================================================
-# Basic universe sources
-# ============================================================
-def get_html_with_header(url):
-    res = requests.get(url, headers=REQUEST_HEADERS, timeout=25)
+def get_text(url, timeout=30):
+    res = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
     res.raise_for_status()
     return res.text
 
 
-def get_sp500_tickers():
-    try:
-        html = get_html_with_header("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = pd.read_html(io.StringIO(html))[0]
-        tickers = sorted(set(clean_ticker(x) for x in df["Symbol"].dropna().tolist()))
-        print(f"✅ S&P500 수집 성공: {len(tickers)}개")
-        return tickers
-    except Exception as e:
-        print(f"❌ S&P500 수집 실패: {e}")
-        return []
-
-
-def get_nasdaq100_tickers():
-    try:
-        html = get_html_with_header("https://en.wikipedia.org/wiki/Nasdaq-100")
-        dfs = pd.read_html(io.StringIO(html), attrs={"id": "constituents"})
-        if not dfs:
-            print("❌ Nasdaq100 테이블을 찾지 못했습니다.")
-            return []
-        tickers = sorted(set(clean_ticker(x) for x in dfs[0]["Ticker"].dropna().tolist()))
-        print(f"✅ Nasdaq100 수집 성공: {len(tickers)}개")
-        return tickers
-    except Exception as e:
-        print(f"❌ Nasdaq100 수집 실패: {e}")
-        return []
-
-
-# ============================================================
-# Russell 2000 / IWM latest source logic
-# ============================================================
 def decode_response_text_safely(response):
     content = response.content
     if content.startswith(b"\xff\xfe") or content.startswith(b"\xfe\xff") or content.count(b"\x00") > max(10, len(content) // 20):
@@ -165,6 +172,35 @@ def decode_response_text_safely(response):
     return response.text.replace("\x00", "")
 
 
+# ============================================================
+# Universe
+# ============================================================
+def get_sp500_tickers():
+    try:
+        html = get_text("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        df = pd.read_html(io.StringIO(html))[0]
+        tickers = sorted(set(clean_ticker(x) for x in df["Symbol"].dropna().tolist()))
+        print(f"✅ S&P500 수집 성공: {len(tickers)}개")
+        return tickers
+    except Exception as e:
+        print(f"❌ S&P500 수집 실패: {e}")
+        return []
+
+
+def get_nasdaq100_tickers():
+    try:
+        html = get_text("https://en.wikipedia.org/wiki/Nasdaq-100")
+        dfs = pd.read_html(io.StringIO(html), attrs={"id": "constituents"})
+        if not dfs:
+            return []
+        tickers = sorted(set(clean_ticker(x) for x in dfs[0]["Ticker"].dropna().tolist()))
+        print(f"✅ Nasdaq100 수집 성공: {len(tickers)}개")
+        return tickers
+    except Exception as e:
+        print(f"❌ Nasdaq100 수집 실패: {e}")
+        return []
+
+
 def normalize_columns(df):
     df = df.copy()
     df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
@@ -172,43 +208,33 @@ def normalize_columns(df):
 
 
 def find_ticker_column(df):
-    normalized = {str(c).strip().lower().replace(" ", "_"): c for c in df.columns}
-    for key in ["ticker", "symbol", "holding_ticker", "constituents"]:
-        if key in normalized:
-            return normalized[key]
     for c in df.columns:
-        lc = str(c).lower()
-        if "ticker" in lc or "symbol" in lc:
+        lc = str(c).strip().lower().replace(" ", "_")
+        if lc in ["ticker", "symbol", "holding_ticker", "constituents"] or "ticker" in lc or "symbol" in lc:
             return c
     return None
 
 
 def parse_iwm_text_to_tickers(text):
-    """iShares CSV/Excel-like text를 최대한 강하게 파싱."""
     text = text.replace("\x00", "").replace("\ufeff", "")
-    if not text.strip():
-        return []
-
-    # 1) pandas read_csv with all possible skip rows near header
     lines = [ln for ln in text.splitlines() if ln.strip()]
-    candidate_header_rows = []
-    for i, line in enumerate(lines[:80]):
+    header_rows = []
+    for i, line in enumerate(lines[:100]):
         norm = line.replace('"', '').lower()
         if "ticker" in norm and ("name" in norm or "sector" in norm or "asset class" in norm or "weight" in norm):
-            candidate_header_rows.append(i)
-
-    for start_idx in candidate_header_rows + [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+            header_rows.append(i)
+    for start in header_rows + list(range(0, min(12, len(lines)))):
         for sep in [",", "\t", ";"]:
             try:
-                df = pd.read_csv(io.StringIO("\n".join(lines[start_idx:])), sep=sep, engine="python", on_bad_lines="skip")
+                df = pd.read_csv(io.StringIO("\n".join(lines[start:])), sep=sep, engine="python", on_bad_lines="skip")
                 if df.empty or len(df.columns) < 2:
                     continue
                 df = normalize_columns(df)
-                tcol = find_ticker_column(df)
-                if tcol is None:
+                col = find_ticker_column(df)
+                if col is None:
                     continue
                 tickers = []
-                for x in df[tcol].dropna().astype(str).tolist():
+                for x in df[col].dropna().astype(str).tolist():
                     t = clean_ticker(x)
                     if t.startswith("THE") or "BLACKROCK" in t:
                         break
@@ -219,42 +245,10 @@ def parse_iwm_text_to_tickers(text):
                     return tickers
             except Exception:
                 pass
-
-    # 2) csv.reader manual fallback
-    for i, line in enumerate(lines):
-        norm = line.replace('"', '').lower()
-        if "ticker" in norm and ("name" in norm or "sector" in norm or "asset class" in norm):
-            delim = "\t" if line.count("\t") > line.count(",") else ","
-            reader = csv.reader(io.StringIO("\n".join(lines[i:])), delimiter=delim)
-            try:
-                header = next(reader)
-            except StopIteration:
-                continue
-            header_norm = [str(h).strip().lower().replace(" ", "_") for h in header]
-            ticker_idx = None
-            for idx, h in enumerate(header_norm):
-                if "ticker" in h or "symbol" in h:
-                    ticker_idx = idx
-                    break
-            if ticker_idx is None:
-                continue
-            tickers = []
-            for row in reader:
-                if len(row) <= ticker_idx:
-                    continue
-                t = clean_ticker(row[ticker_idx])
-                if t.startswith("THE") or "BLACKROCK" in t:
-                    break
-                if is_valid_us_ticker(t):
-                    tickers.append(t)
-            tickers = sorted(set(tickers))
-            if len(tickers) >= 1000:
-                return tickers
     return []
 
 
 def get_iwm_official_holdings():
-    """iShares IWM 공식 holdings를 우선 사용. 성공 시 source_detail 포함."""
     urls = [
         "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
         "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings",
@@ -262,61 +256,29 @@ def get_iwm_official_holdings():
         "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv",
     ]
     headers = dict(REQUEST_HEADERS)
-    headers.update({
-        "Accept": "text/csv,application/csv,text/plain,application/octet-stream,*/*",
-        "Referer": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf",
-    })
+    headers.update({"Accept": "text/csv,application/csv,text/plain,application/octet-stream,*/*", "Referer": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf"})
     for url in urls:
         try:
             print("📥 Russell2000 최신 후보: iShares IWM 공식 holdings CSV 시도")
             res = requests.get(url, headers=headers, timeout=45)
             res.raise_for_status()
-            text = decode_response_text_safely(res)
-            tickers = parse_iwm_text_to_tickers(text)
+            tickers = parse_iwm_text_to_tickers(decode_response_text_safely(res))
             if len(tickers) >= 1500:
                 return tickers, f"iShares IWM official CSV ({len(tickers)} tickers)"
             print(f"⚠️ iShares CSV 파싱 결과 적음: {len(tickers)}개")
         except Exception as e:
             print(f"⚠️ iShares CSV 수집 실패: {e}")
-
-    # HTML table fallback. Often static page only exposes partial table, but worth trying.
-    try:
-        print("📥 Russell2000 최신 후보: iShares IWM 공식 HTML table 시도")
-        html = get_html_with_header("https://www.ishares.com/us/products/239710/ishares-russell-2000-etf")
-        tables = pd.read_html(io.StringIO(html))
-        best = []
-        for df in tables:
-            df = normalize_columns(df)
-            tcol = find_ticker_column(df)
-            if tcol is None:
-                continue
-            tickers = sorted(set(clean_ticker(x) for x in df[tcol].dropna().astype(str).tolist() if is_valid_us_ticker(clean_ticker(x))))
-            if len(tickers) > len(best):
-                best = tickers
-        if len(best) >= 1000:
-            return best, f"iShares IWM official HTML ({len(best)} tickers)"
-        print(f"⚠️ iShares HTML 파싱 결과 적음: {len(best)}개")
-    except Exception as e:
-        print(f"⚠️ iShares HTML 수집 실패: {e}")
-
     return [], "iShares official failed"
 
 
 def parse_generic_csv_tickers(text):
-    text = text.replace("\x00", "").replace("\ufeff", "")
     try:
-        df = pd.read_csv(io.StringIO(text))
+        df = pd.read_csv(io.StringIO(text.replace("\x00", "").replace("\ufeff", "")))
         df = normalize_columns(df)
-        tcol = find_ticker_column(df)
-        if tcol is None:
-            # quanthero 파일은 constituents 컬럼일 수 있음
-            for c in df.columns:
-                if "constituents" in str(c).lower():
-                    tcol = c
-                    break
-        if tcol is None and len(df.columns) > 0:
-            tcol = df.columns[0]
-        tickers = sorted(set(clean_ticker(x) for x in df[tcol].dropna().astype(str).tolist() if is_valid_us_ticker(clean_ticker(x))))
+        col = find_ticker_column(df)
+        if col is None and len(df.columns) > 0:
+            col = df.columns[0]
+        tickers = sorted(set(clean_ticker(x) for x in df[col].dropna().astype(str).tolist() if is_valid_us_ticker(clean_ticker(x))))
         return tickers
     except Exception:
         return []
@@ -327,36 +289,28 @@ def get_russell2000_tickers():
     if len(tickers) >= 1500:
         print(f"✅ Russell2000/IWM 최신 소스 성공: {source}")
         return tickers, source
-
-    fallback_sources = [
+    fallbacks = [
         ("GitHub quanthero fallback", "https://raw.githubusercontent.com/quanthero/US_Indices_Constituents/main/Russell2000.csv"),
         ("GitHub ikoniaris fallback", "https://raw.githubusercontent.com/ikoniaris/Russell2000/master/russell_2000_components.csv"),
     ]
-    for name, url in fallback_sources:
+    for name, url in fallbacks:
         try:
             print(f"📥 Russell2000 fallback 수집 시도: {name}")
             res = requests.get(url, headers=REQUEST_HEADERS, timeout=35)
             res.raise_for_status()
-            text = decode_response_text_safely(res)
-            tickers = parse_generic_csv_tickers(text)
+            tickers = parse_generic_csv_tickers(decode_response_text_safely(res))
             if len(tickers) >= 1400:
                 print(f"✅ Russell2000 fallback 수집 성공({name}): {len(tickers)}개")
                 return tickers, f"{name} + official listing validation"
-            print(f"⚠️ {name} 파싱 결과 적음: {len(tickers)}개")
         except Exception as e:
             print(f"⚠️ {name} 수집 실패: {e}")
-    print("❌ Russell2000 티커 수집 최종 실패")
     return [], "Russell2000 source failed"
 
 
-# ============================================================
-# Official listing validation
-# ============================================================
 def parse_pipe_text(text):
-    text = text.replace("\ufeff", "")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    useful_lines = [ln for ln in lines if not ln.startswith("File Creation Time")]
-    return pd.read_csv(io.StringIO("\n".join(useful_lines)), sep="|") if useful_lines else pd.DataFrame()
+    lines = [ln.strip() for ln in text.replace("\ufeff", "").splitlines() if ln.strip()]
+    useful = [ln for ln in lines if not ln.startswith("File Creation Time")]
+    return pd.read_csv(io.StringIO("\n".join(useful)), sep="|") if useful else pd.DataFrame()
 
 
 def get_official_listed_universe():
@@ -370,18 +324,9 @@ def get_official_listed_universe():
             sym = clean_ticker(row.get("Symbol", ""))
             if not sym or sym.startswith("FILE"):
                 continue
-            official[sym] = {
-                "symbol": sym,
-                "name": str(row.get("Security Name", "")),
-                "exchange": "NASDAQ",
-                "etf": str(row.get("ETF", "N")),
-                "test_issue": str(row.get("Test Issue", "N")),
-                "financial_status": str(row.get("Financial Status", "N")),
-                "source": "nasdaqlisted.txt",
-            }
+            official[sym] = {"symbol": sym, "name": str(row.get("Security Name", "")), "exchange": "NASDAQ", "etf": str(row.get("ETF", "N")), "test_issue": str(row.get("Test Issue", "N")), "financial_status": str(row.get("Financial Status", "N")), "source": "nasdaqlisted.txt"}
     except Exception as e:
         print(f"⚠️ Nasdaq Trader nasdaqlisted 실패: {e}")
-
     try:
         print("📥 공식 상장 리스트 수집: Nasdaq Trader otherlisted.txt")
         res = requests.get("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", headers=REQUEST_HEADERS, timeout=30)
@@ -391,51 +336,9 @@ def get_official_listed_universe():
             sym = clean_ticker(row.get("ACT Symbol", ""))
             if not sym or sym.startswith("FILE"):
                 continue
-            official[sym] = {
-                "symbol": sym,
-                "name": str(row.get("Security Name", "")),
-                "exchange": str(row.get("Exchange", "")),
-                "etf": str(row.get("ETF", "N")),
-                "test_issue": str(row.get("Test Issue", "N")),
-                "financial_status": "N",
-                "source": "otherlisted.txt",
-            }
+            official[sym] = {"symbol": sym, "name": str(row.get("Security Name", "")), "exchange": str(row.get("Exchange", "")), "etf": str(row.get("ETF", "N")), "test_issue": str(row.get("Test Issue", "N")), "financial_status": "N", "source": "otherlisted.txt"}
     except Exception as e:
         print(f"⚠️ Nasdaq Trader otherlisted 실패: {e}")
-
-    if len(official) < 3000:
-        print("⚠️ 공식 상장 리스트가 적어 DataHub fallback 시도")
-        fallback_sources = [
-            ("datahub_nasdaq", "https://datahub.io/core/nasdaq-listings/_r/-/data/nasdaq-listed-symbols.csv"),
-            ("datahub_other", "https://datahub.io/core/nyse-other-listings/_r/-/data/other-listed.csv"),
-        ]
-        for source, url in fallback_sources:
-            try:
-                df = pd.read_csv(url)
-                for _, row in df.iterrows():
-                    sym = ""
-                    for col in ["Symbol", "ACT Symbol", "symbol", "Ticker", "ticker"]:
-                        if col in df.columns:
-                            sym = clean_ticker(row.get(col, ""))
-                            break
-                    if not sym or sym.startswith("FILE"):
-                        continue
-                    name = ""
-                    for col in ["Security Name", "Company Name", "company_name", "name"]:
-                        if col in df.columns:
-                            name = str(row.get(col, ""))
-                            break
-                    official.setdefault(sym, {
-                        "symbol": sym,
-                        "name": name,
-                        "exchange": str(row.get("Exchange", row.get("exchange", "UNKNOWN"))),
-                        "etf": str(row.get("ETF", row.get("etf", "N"))),
-                        "test_issue": str(row.get("Test Issue", row.get("test_issue", "N"))),
-                        "financial_status": str(row.get("Financial Status", row.get("financial_status", "N"))),
-                        "source": source,
-                    })
-            except Exception as e:
-                print(f"⚠️ {source} fallback 실패: {e}")
     print(f"✅ 공식 상장 리스트 확보: {len(official)}개")
     return official
 
@@ -443,8 +346,8 @@ def get_official_listed_universe():
 def validate_candidate_universe(tickers, official_map):
     included, excluded_not_listed, excluded_non_common = [], [], []
     seen = set()
-    for raw_t in tickers:
-        t = clean_ticker(raw_t)
+    for raw in tickers:
+        t = clean_ticker(raw)
         if not t or t in seen:
             continue
         seen.add(t)
@@ -469,20 +372,18 @@ def validate_candidate_universe(tickers, official_map):
 
 
 # ============================================================
-# Price, RS, Trend, VCP
+# Price and filters
 # ============================================================
 def get_ticker_dataframe(raw_data, ticker):
     try:
         if raw_data is None or raw_data.empty:
             return None
         if isinstance(raw_data.columns, pd.MultiIndex):
-            if ticker in raw_data.columns.get_level_values(0):
-                return raw_data[ticker].copy()
-            return None
+            return raw_data[ticker].copy() if ticker in raw_data.columns.get_level_values(0) else None
         if "Close" in raw_data.columns:
             return raw_data.copy()
     except Exception:
-        pass
+        return None
     return None
 
 
@@ -502,6 +403,12 @@ def prepare_price_dataframe(df):
     df["MA200"] = df["Close"].rolling(200).mean()
     df["Vol_MA50"] = df["Volume"].rolling(50).mean()
     df["DollarVol_MA50"] = df["Close"].rolling(50).mean() * df["Vol_MA50"]
+    tr1 = df["High"] - df["Low"]
+    tr2 = (df["High"] - df["Close"].shift(1)).abs()
+    tr3 = (df["Low"] - df["Close"].shift(1)).abs()
+    df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["ATR10"] = df["TR"].rolling(10).mean()
+    df["ATR30"] = df["TR"].rolling(30).mean()
     return df
 
 
@@ -533,24 +440,11 @@ def calculate_rs_scores(price_data):
 def passes_market_filter():
     if not MARKET_FILTER_ENABLED:
         return True, "비활성화: Yahoo SSL/rate limit 회피"
-    try:
-        data = yf.download(["SPY", "QQQ"], period="1y", interval="1d", group_by="ticker", progress=False, threads=False, timeout=30, auto_adjust=True)
-        oks = []
-        for idx in ["SPY", "QQQ"]:
-            df = data[idx].copy() if isinstance(data.columns, pd.MultiIndex) and idx in data.columns.get_level_values(0) else data.copy()
-            df = df.dropna(subset=["Close"]).copy()
-            if len(df) < 220:
-                return False, "시장 ETF 데이터 부족"
-            df["MA50"] = df["Close"].rolling(50).mean()
-            df["MA200"] = df["Close"].rolling(200).mean()
-            oks.append(df["Close"].iloc[-1] > df["MA50"].iloc[-1] > df["MA200"].iloc[-1])
-        return (True, "양호: SPY/QQQ 상승 추세") if all(oks) else (False, "주의: SPY 또는 QQQ 상승 추세 미충족")
-    except Exception as e:
-        print(f"⚠️ 시장 환경 필터 확인 실패: {e}")
-        return False, "시장 환경 확인 실패"
+    return True, "활성화되지 않음"
 
 
 def passes_trend_template(ticker, df, rs_info):
+    c = cfg()
     try:
         cp = df["Close"].iloc[-1]
         ma50, ma150, ma200 = df["MA50"].iloc[-1], df["MA150"].iloc[-1], df["MA200"].iloc[-1]
@@ -569,8 +463,8 @@ def passes_trend_template(ticker, df, rs_info):
             ma50 > ma150 and ma50 > ma200,
             cp > ma50,
             cp >= low52 * 1.30,
-            cp >= high52 * 0.75,
-            rs >= MIN_RS_RATING,
+            cp >= high52 * c["high52"],
+            rs >= c["rs"],
             avg_vol >= MIN_AVG_VOLUME,
             avg_dvol >= MIN_DOLLAR_VOLUME,
         ])
@@ -580,39 +474,75 @@ def passes_trend_template(ticker, df, rs_info):
 
 
 def check_vcp_pattern(ticker, df):
+    c = cfg()
     try:
-        recent = df.tail(65).copy()
-        if len(recent) < 65:
+        recent = df.tail(75).copy()
+        if len(recent) < 75:
             return False, {}
-        seg1, seg2, seg3 = recent.iloc[0:25], recent.iloc[25:45], recent.iloc[45:65]
+        seg1, seg2, seg3 = recent.iloc[0:30], recent.iloc[30:55], recent.iloc[55:75]
         def cr(seg):
             low, high = seg["Low"].min(), seg["High"].max()
             return None if low <= 0 else (high - low) / low
         r1, r2, r3 = cr(seg1), cr(seg2), cr(seg3)
         if r1 is None or r2 is None or r3 is None:
             return False, {}
-        if not (r1 > r2 > r3) or r3 > VCP_MAX_LAST_CONTRACTION:
-            return False, {}
-        vol_early, vol_recent, vol_ma50 = recent["Volume"].iloc[0:30].mean(), recent["Volume"].iloc[-10:].mean(), df["Vol_MA50"].iloc[-1]
-        if pd.isna(vol_early) or pd.isna(vol_recent) or pd.isna(vol_ma50) or not (vol_recent < vol_early):
-            return False, {}
+
+        vol_early = recent["Volume"].iloc[0:35].mean()
+        vol_recent = recent["Volume"].iloc[-10:].mean()
+        vol_ma50 = df["Vol_MA50"].iloc[-1]
+        atr10, atr30 = df["ATR10"].iloc[-1], df["ATR30"].iloc[-1]
         current, current_vol = df["Close"].iloc[-1], df["Volume"].iloc[-1]
         pivot = recent["High"].tail(20).max()
         stop = max(recent["Low"].tail(20).min(), df["MA50"].iloc[-1] * 0.97)
         risk = (pivot - stop) / pivot * 100
-        if risk <= 0 or risk > MAX_RISK_PCT:
-            return False, {}
         dist = (pivot - current) / pivot * 100
-        near_pivot = current <= pivot * 1.03 and current >= pivot * (1 - PIVOT_NEAR_PCT / 100)
+
+        near_pivot = current <= pivot * 1.03 and current >= pivot * (1 - c["pivot_near"] / 100)
         breakout = current > pivot and current_vol >= vol_ma50 * 1.5
-        if not near_pivot and not breakout:
-            return False, {}
-        return True, {
-            "setup_type": "BREAKOUT" if breakout else "WATCH",
-            "current_price": round(current, 2), "entry": round(pivot, 2), "stop": round(stop, 2), "risk": round(risk, 1),
-            "distance_from_pivot": round(dist, 1), "vcp_r1": round(r1 * 100, 1), "vcp_r2": round(r2 * 100, 1), "vcp_r3": round(r3 * 100, 1),
-            "vol_decline": round((1 - vol_recent / vol_early) * 100, 1), "breakout_volume_ratio": round(current_vol / vol_ma50, 2),
+        tight_closes = recent["Close"].tail(10).std() / recent["Close"].tail(10).mean()
+        high_proximity = current >= recent["High"].max() * 0.95
+
+        score_items = {
+            "range_contracts": r1 > r2 > r3,
+            "meaningful_contracts": r2 <= r1 * c["contraction_ratio"] and r3 <= r2 * c["contraction_ratio"],
+            "last_contraction_ok": r3 <= c["last_contraction"],
+            "volume_dryup": vol_recent <= vol_early * c["volume_dryup"],
+            "atr_dryup": False if pd.isna(atr10) or pd.isna(atr30) or atr30 <= 0 else atr10 <= atr30 * c["atr_dryup"],
+            "near_pivot_or_breakout": near_pivot or breakout,
+            "risk_ok": 0 < risk <= c["max_risk"],
+            "tight_closes": tight_closes <= 0.025,
+            "high_proximity": high_proximity,
         }
+        # 9개 중 점수. high_proximity는 정석성 보조 조건으로 포함.
+        vcp_score = sum(1 for v in score_items.values() if v)
+
+        # 필수 조건: 수축 방향, 피벗 근처, 리스크
+        essential = score_items["range_contracts"] and score_items["near_pivot_or_breakout"] and score_items["risk_ok"]
+        if not essential:
+            return False, {}
+        if vcp_score < c["min_vcp_score"]:
+            return False, {}
+
+        quality = "STRICT_LIKE" if vcp_score >= 8 and r3 <= VCP_LAST_CONTRACTION_STRICT else "BALANCED"
+        details = {
+            "setup_type": "BREAKOUT" if breakout else "WATCH",
+            "vcp_quality": quality,
+            "vcp_score": vcp_score,
+            "vcp_checks": "; ".join([k for k, v in score_items.items() if v]),
+            "current_price": round(current, 2),
+            "entry": round(pivot, 2),
+            "stop": round(stop, 2),
+            "risk": round(risk, 1),
+            "distance_from_pivot": round(dist, 1),
+            "vcp_r1": round(r1 * 100, 1),
+            "vcp_r2": round(r2 * 100, 1),
+            "vcp_r3": round(r3 * 100, 1),
+            "vol_decline": round((1 - vol_recent / vol_early) * 100, 1) if vol_early > 0 else None,
+            "atr10_atr30_ratio": round(atr10 / atr30, 2) if not pd.isna(atr10) and not pd.isna(atr30) and atr30 > 0 else None,
+            "tight_close_pct": round(tight_closes * 100, 2),
+            "breakout_volume_ratio": round(current_vol / vol_ma50, 2) if vol_ma50 and vol_ma50 > 0 else None,
+        }
+        return True, details
     except Exception as e:
         print(f"⚠️ {ticker} VCP 검사 오류: {e}")
         return False, {}
@@ -629,16 +559,16 @@ def build_fundamental_reason(status, eps, rev, raw_reason):
     if status == "PASS":
         return f"통과: EPS {eps_txt} ≥ {eps_req}, 매출 {rev_txt} ≥ {rev_req}"
     if status == "FAIL":
-        fail_parts = []
+        parts = []
         if eps is None:
-            fail_parts.append(f"EPS 데이터 없음, 기준 {eps_req}")
+            parts.append(f"EPS 데이터 없음, 기준 {eps_req}")
         elif eps < MIN_EPS_GROWTH:
-            fail_parts.append(f"EPS {eps_txt} < 기준 {eps_req}")
+            parts.append(f"EPS {eps_txt} < 기준 {eps_req}")
         if rev is None:
-            fail_parts.append(f"매출 데이터 없음, 기준 {rev_req}")
+            parts.append(f"매출 데이터 없음, 기준 {rev_req}")
         elif rev < MIN_REV_GROWTH:
-            fail_parts.append(f"매출 {rev_txt} < 기준 {rev_req}")
-        return "미통과: " + "; ".join(fail_parts)
+            parts.append(f"매출 {rev_txt} < 기준 {rev_req}")
+        return "미통과: " + "; ".join(parts)
     return f"미확인: {raw_reason}; EPS {eps_txt}, 매출 {rev_txt}"
 
 
@@ -649,8 +579,7 @@ def get_fundamental_info(ticker):
             eps, rev = info.get("earningsGrowth"), info.get("revenueGrowth")
             sector, industry = info.get("sector", ""), info.get("industry", "")
             if eps is None or rev is None:
-                reason = build_fundamental_reason("UNKNOWN", eps, rev, "yfinance 실적 데이터 없음")
-                return "UNKNOWN", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": reason}
+                return "UNKNOWN", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": build_fundamental_reason("UNKNOWN", eps, rev, "yfinance 실적 데이터 없음")}
             if eps >= MIN_EPS_GROWTH and rev >= MIN_REV_GROWTH:
                 return "PASS", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": build_fundamental_reason("PASS", eps, rev, "")}
             return "FAIL", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": build_fundamental_reason("FAIL", eps, rev, "성장률 기준 미달")}
@@ -669,6 +598,7 @@ def get_fundamental_info(ticker):
 # ============================================================
 def main():
     today = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d")
+    c = cfg()
 
     print("📦 1. 미국 시장 종목 명단 수집 시작...")
     sp_list = get_sp500_tickers()
@@ -692,6 +622,7 @@ def main():
     pd.DataFrame(excluded_non_common).to_csv(f"excluded_non_common_{today}.csv", index=False)
     pd.DataFrame([{
         "date": today,
+        "mode": c["mode"],
         "russell2000_source": russell_source,
         "sp500_count": len(sp_list),
         "nasdaq100_count": len(nd_list),
@@ -700,6 +631,10 @@ def main():
         "official_common_universe_count": len(tickers),
         "excluded_not_listed_count": len(excluded_not_listed),
         "excluded_non_common_count": len(excluded_non_common),
+        "min_rs_rating": c["rs"],
+        "high52_threshold": c["high52"],
+        "last_contraction_threshold": c["last_contraction"],
+        "min_vcp_score": c["min_vcp_score"],
     }]).to_csv(f"universe_source_summary_{today}.csv", index=False)
 
     _, market_status = passes_market_filter()
@@ -731,13 +666,7 @@ def main():
             price_data[t] = df
         else:
             meta = official_map.get(t, {})
-            yfinance_failed_but_listed.append({
-                "ticker": t,
-                "reason": "LISTED_BUT_YFINANCE_PRICE_DATA_FAILED_OR_INSUFFICIENT",
-                "name": meta.get("name", ""),
-                "exchange": meta.get("exchange", ""),
-                "source": meta.get("source", ""),
-            })
+            yfinance_failed_but_listed.append({"ticker": t, "reason": "LISTED_BUT_YFINANCE_PRICE_DATA_FAILED_OR_INSUFFICIENT", "name": meta.get("name", ""), "exchange": meta.get("exchange", ""), "source": meta.get("source", "")})
     pd.DataFrame(yfinance_failed_but_listed).to_csv(f"yfinance_failed_but_listed_{today}.csv", index=False)
 
     rs_map = calculate_rs_scores(price_data)
@@ -752,17 +681,17 @@ def main():
             passed_trend.append((t, df, rs))
     print(f"🎯 트렌드 템플릿 통과: {len(passed_trend)}개")
 
-    print("📉 6. VCP 검사 먼저 수행 — 실적 조회 호출 수 최소화...")
+    print("📉 6. VCP 정석 조건 검사")
     vcp_candidates = []
     for t, df, rs in passed_trend:
         ok_v, v = check_vcp_pattern(t, df)
         if ok_v:
             vcp_candidates.append((t, df, rs, v))
-            print(f"✅ VCP 후보: {t} | {v['setup_type']} | Risk {v['risk']}% | RS {rs.get('rs_rating', 0)}")
-    vcp_candidates = sorted(vcp_candidates, key=lambda x: (0 if x[3]["setup_type"] == "BREAKOUT" else 1, -x[2].get("rs_rating", 0), abs(x[3]["distance_from_pivot"])))
+            print(f"✅ VCP 후보: {t} | {v['setup_type']} | {v['vcp_quality']} | Score {v['vcp_score']} | Risk {v['risk']}% | RS {rs.get('rs_rating', 0)}")
+    vcp_candidates = sorted(vcp_candidates, key=lambda x: (0 if x[3]["setup_type"] == "BREAKOUT" else 1, -x[3]["vcp_score"], -x[2].get("rs_rating", 0), abs(x[3]["distance_from_pivot"])))
     print(f"🎯 VCP 후보: {len(vcp_candidates)}개")
 
-    print("🧬 7. VCP 후보에 대해서만 펀더멘탈 검사...")
+    print("🧬 7. VCP 후보에 대해서만 펀더멘탈 검사")
     final, tech_only = [], []
     for idx, (t, df, rs, v) in enumerate(vcp_candidates[:MAX_FUNDAMENTAL_CALLS], start=1):
         print(f"   ↳ [{idx}/{min(len(vcp_candidates), MAX_FUNDAMENTAL_CALLS)}] {t} 실적 조회")
@@ -773,6 +702,9 @@ def main():
         base = {
             "ticker": t,
             "setup_type": v["setup_type"],
+            "vcp_quality": v["vcp_quality"],
+            "vcp_score": v["vcp_score"],
+            "vcp_checks": v["vcp_checks"],
             "fundamental_status": status,
             "fundamental_reason": f.get("reason", ""),
             "official_name": meta.get("name", ""),
@@ -794,6 +726,8 @@ def main():
             "vcp_r2_pct": v["vcp_r2"],
             "vcp_r3_pct": v["vcp_r3"],
             "vol_decline_pct": v["vol_decline"],
+            "atr10_atr30_ratio": v["atr10_atr30_ratio"],
+            "tight_close_pct": v["tight_close_pct"],
             "breakout_volume_ratio": v["breakout_volume_ratio"],
         }
         if status == "PASS":
@@ -803,40 +737,24 @@ def main():
         print(f"      실적결과: {status} | {base['fundamental_reason']}")
         time.sleep(FUNDAMENTAL_SLEEP + random.uniform(0, 1))
 
+    # 실적 조회 한도 밖 VCP 후보도 watch로 저장
     for t, df, rs, v in vcp_candidates[MAX_FUNDAMENTAL_CALLS:]:
         meta = official_map.get(t, {})
         tech_only.append({
-            "ticker": t,
-            "setup_type": v["setup_type"],
-            "fundamental_status": "NOT_CHECKED",
-            "fundamental_reason": "실적 조회 호출 제한으로 미확인",
-            "official_name": meta.get("name", ""),
-            "official_exchange": meta.get("exchange", ""),
-            "current_price": v["current_price"],
-            "entry": v["entry"],
-            "stop": v["stop"],
-            "risk": v["risk"],
-            "distance_from_pivot": v["distance_from_pivot"],
-            "rs_rating": rs.get("rs_rating", 0),
-            "r3_return_pct": round(rs.get("r3", 0) * 100, 1),
-            "r6_return_pct": round(rs.get("r6", 0) * 100, 1),
-            "r12_return_pct": round(rs.get("r12", 0) * 100, 1),
-            "eps_growth_pct": None,
-            "rev_growth_pct": None,
-            "sector": "",
-            "industry": "",
-            "vcp_r1_pct": v["vcp_r1"],
-            "vcp_r2_pct": v["vcp_r2"],
-            "vcp_r3_pct": v["vcp_r3"],
-            "vol_decline_pct": v["vol_decline"],
-            "breakout_volume_ratio": v["breakout_volume_ratio"],
+            "ticker": t, "setup_type": v["setup_type"], "vcp_quality": v["vcp_quality"], "vcp_score": v["vcp_score"], "vcp_checks": v["vcp_checks"],
+            "fundamental_status": "NOT_CHECKED", "fundamental_reason": "실적 조회 호출 제한으로 미확인",
+            "official_name": meta.get("name", ""), "official_exchange": meta.get("exchange", ""),
+            "current_price": v["current_price"], "entry": v["entry"], "stop": v["stop"], "risk": v["risk"], "distance_from_pivot": v["distance_from_pivot"],
+            "rs_rating": rs.get("rs_rating", 0), "r3_return_pct": round(rs.get("r3", 0) * 100, 1), "r6_return_pct": round(rs.get("r6", 0) * 100, 1), "r12_return_pct": round(rs.get("r12", 0) * 100, 1),
+            "eps_growth_pct": None, "rev_growth_pct": None, "sector": "", "industry": "",
+            "vcp_r1_pct": v["vcp_r1"], "vcp_r2_pct": v["vcp_r2"], "vcp_r3_pct": v["vcp_r3"], "vol_decline_pct": v["vol_decline"], "atr10_atr30_ratio": v["atr10_atr30_ratio"], "tight_close_pct": v["tight_close_pct"], "breakout_volume_ratio": v["breakout_volume_ratio"],
         })
 
     cols = [
-        "ticker", "setup_type", "fundamental_status", "fundamental_reason", "official_name", "official_exchange",
+        "ticker", "setup_type", "vcp_quality", "vcp_score", "vcp_checks", "fundamental_status", "fundamental_reason", "official_name", "official_exchange",
         "current_price", "entry", "stop", "risk", "distance_from_pivot", "rs_rating",
         "r3_return_pct", "r6_return_pct", "r12_return_pct", "eps_growth_pct", "rev_growth_pct",
-        "sector", "industry", "vcp_r1_pct", "vcp_r2_pct", "vcp_r3_pct", "vol_decline_pct", "breakout_volume_ratio"
+        "sector", "industry", "vcp_r1_pct", "vcp_r2_pct", "vcp_r3_pct", "vol_decline_pct", "atr10_atr30_ratio", "tight_close_pct", "breakout_volume_ratio"
     ]
     strict_file = f"minervini_strict_{today}.csv"
     watch_file = f"minervini_watchlist_{today}.csv"
@@ -846,16 +764,17 @@ def main():
     print(f"👀 기술+VCP 후보/실적 미확인 또는 미달: {len(tech_only)}개")
     print(f"💾 CSV 저장: {strict_file}, {watch_file}")
 
-    def format_items(items, title, limit=10):
+    def fmt(items, title, limit=10):
         if not items:
             return f"{title}: 없음"
         lines = [title]
         for item in items[:limit]:
             reason = item.get("fundamental_reason", "")
-            if len(reason) > 90:
-                reason = reason[:87] + "..."
+            if len(reason) > 85:
+                reason = reason[:82] + "..."
             lines.append(
-                f"• {item['ticker']} [{item['setup_type']}] 현재 {item['current_price']}$ | 진입 {item['entry']}$ | 손절 {item['stop']}$ | 리스크 {item['risk']}% | RS {item['rs_rating']}\n"
+                f"• {item['ticker']} [{item['setup_type']}/{item['vcp_quality']}] Score {item['vcp_score']} | 현재 {item['current_price']}$ | 진입 {item['entry']}$ | 손절 {item['stop']}$ | 리스크 {item['risk']}% | RS {item['rs_rating']}\n"
+                f"  VCP: {item['vcp_r1_pct']}%→{item['vcp_r2_pct']}%→{item['vcp_r3_pct']}%, ATR비율 {item['atr10_atr30_ratio']}, 거래량감소 {item['vol_decline_pct']}%\n"
                 f"  실적: {item['fundamental_status']} | 사유: {reason}"
             )
         if len(items) > limit:
@@ -863,23 +782,23 @@ def main():
         return "\n".join(lines)
 
     msg = (
-        f"🔔 [{today}] 미너비니 정밀 스크리닝 결과 v7\n"
+        f"🔔 [{today}] 미너비니 정밀 스크리닝 결과 v8\n"
         f"------------------------------------\n"
+        f"⚙️ 모드: {c['mode']} | RS≥{c['rs']} | 52주고점 {int(c['high52']*100)}% 이상 | VCP Score≥{c['min_vcp_score']}\n"
         f"📌 Russell2000 소스: {russell_source}\n"
         f"📊 원본: S&P500 {len(sp_list)}개 | Nasdaq100 {len(nd_list)}개 | Russell2000 {len(ru_list)}개\n"
         f"🧾 공식 상장 보통주 후보: {len(tickers)}개\n"
         f"🧹 공식 미등록 제외: {len(excluded_not_listed)}개 | ETF/비보통주 제외: {len(excluded_non_common)}개\n"
-        f"🌎 시장 환경: {market_status}\n"
         f"📈 유효 가격 데이터: {len(price_data)}개 | yfinance 실패: {len(yfinance_failed_but_listed)}개\n"
         f"✅ 트렌드 템플릿 통과: {len(passed_trend)}개\n"
         f"✅ VCP 후보: {len(vcp_candidates)}개\n"
         f"🔥 실적까지 확인 통과: {len(final)}개\n"
-        f"👀 기술+VCP 후보(실적 미확인/미달 포함): {len(tech_only)}개\n\n"
-        f"{format_items(final, '🔥 Strict 후보')}\n\n"
-        f"{format_items(tech_only, '👀 Watch 후보')}\n"
+        f"👀 기술+VCP 후보: {len(tech_only)}개\n\n"
+        f"{fmt(final, '🔥 Strict 후보')}\n\n"
+        f"{fmt(tech_only, '👀 Watch 후보')}\n"
         f"------------------------------------\n"
         f"※ 투자 추천이 아닌 자동 선별 결과입니다.\n"
-        f"※ v7은 iShares IWM 공식 holdings를 우선 시도하고, 실패 시 fallback과 공식 상장 검증을 사용합니다."
+        f"※ v8은 너무 Severe하지 않도록 BALANCED 모드에서 VCP 점수제를 사용합니다."
     )
     send_telegram_message(msg)
     print("🎯 전체 스크리닝 완료")
