@@ -43,12 +43,13 @@ def send_telegram_message(message, title=""):
 def run_korea_minervini():
     print(f"🇰🇷 한국 미너비니 SEPA 스크리너 시작 - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     
-    import FinanceDataReader as fdr
+    import FinanceDataReader as fdr   # ← 여기서 import
     
     stocks = fdr.StockListing('KRX')
-    stocks = stocks[stocks['MarketCap'] > 300000000000].copy()  # 3000억 이상
+    stocks = stocks[stocks['MarketCap'] > 300000000000].copy()
     
     results = []
+    print(f"분석 대상: {len(stocks)}개")
     
     for _, row in stocks.iterrows():
         try:
@@ -62,12 +63,10 @@ def run_korea_minervini():
             latest = df.iloc[-1]
             price = float(latest['Close'])
             
-            # 이동평균
             ma50 = df['Close'].rolling(50).mean().iloc[-1]
             ma150 = df['Close'].rolling(150).mean().iloc[-1]
             ma200 = df['Close'].rolling(200).mean().iloc[-1]
             
-            # Trend Template
             tt_score = 0
             if price > ma200 and price > ma150: tt_score += 1
             if ma150 > ma200: tt_score += 1
@@ -104,13 +103,13 @@ def run_korea_minervini():
     df_result = pd.DataFrame(results).head(12)
     
     if df_result.empty:
-        message = "🟡 오늘은 미너비니 조건을 만족하는 한국 종목이 없습니다."
+        message = "🟡 오늘은 조건을 만족하는 한국 종목이 없습니다."
     else:
-        message = f"🔔 미너비니 SEPA Daily Report (한국시장) - {datetime.now().strftime('%Y-%m-%d')}\n\n"
+        message = f"🔔 미너비니 SEPA Daily Report (한국) - {datetime.now().strftime('%Y-%m-%d')}\n\n"
         for _, r in df_result.iterrows():
             message += f"📌 {r['종목명']} ({r['티커']})\n"
             message += f"현재가: {r['현재가']:,}원\n"
-            message += f"진입: {r['진입가']:,}원 (+2%)\n"
+            message += f"진입: {r['진입가']:,}원\n"
             message += f"손절 (ATR2x): {r['손절가']:,}원\n"
             message += f"TT:{r['TT']} | VCP:{r['VCP']} | ATR:{r['ATR']} | 고점대비:{r['고점대비']}%\n\n"
     
