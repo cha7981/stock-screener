@@ -2,3 +2,5 @@ yfinance
 pandas
 requests
 lxml
+finance-datareader
+numpy
