@@ -21,4 +21,10 @@ jobs:
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.CHAT_ID }}
-      run: pip install yfinance pandas requests lxml beautifulsoup4 html5lib && python screener.py
+      run: |
+        pip install yfinance pandas requests lxml beautifulsoup4 html5lib
+        echo "=========================================="
+        echo "🔍 컴퓨터가 보는 현재 폴더 파일 목록:"
+        ls -la
+        echo "=========================================="
+        python screener.py
