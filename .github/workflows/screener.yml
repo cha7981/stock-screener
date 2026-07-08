@@ -42,17 +42,11 @@ jobs:
       - name: Install dependencies
         run: pip install yfinance pandas requests lxml beautifulsoup4 html5lib
 
-      - name: Run US Screener (기존)
+      - name: Run Screener
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python screener.py
-
-      - name: Run Korea Minervini Screener (추가)
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_TOKEN }}
-        run: python korea_minervini.py
 
       - name: Upload result CSV
         if: always()
