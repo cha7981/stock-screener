@@ -20,7 +20,6 @@ MAX_RISK_PCT = 8.0
 PIVOT_NEAR_PCT = 5.0
 VCP_MAX_LAST_CONTRACTION = 0.08
 MARKET_FILTER_ENABLED = True
-
 PRICE_PERIOD = "18mo"
 CHUNK_SIZE = 150
 SLEEP_BETWEEN_CHUNKS = 2
@@ -31,40 +30,33 @@ def send_telegram_message(message):
         print("❌ 에러: 텔레그램 환경변수 TELEGRAM_TOKEN 또는 CHAT_ID가 없습니다.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        if response.status_code != 200:
-            print(f"⚠️ 텔레그램 전송 실패: {response.text}")
+        res = requests.post(url, json={"chat_id": CHAT_ID, "text": message}, timeout=15)
+        if res.status_code != 200:
+            print(f"⚠️ 텔레그램 전송 실패: {res.text}")
     except Exception as e:
         print(f"⚠️ 텔레그램 전송 에러: {e}")
-
-
-def get_html_with_header(url):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
-    return response.text
 
 
 def clean_ticker(ticker):
     if ticker is None:
         return ""
-    ticker = str(ticker).strip().replace(".", "-")
-    return ticker
+    return str(ticker).strip().replace(".", "-")
+
+
+def get_html_with_header(url):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+    res = requests.get(url, headers=headers, timeout=20)
+    res.raise_for_status()
+    return res.text
 
 
 def get_sp500_tickers():
     try:
         html = get_html_with_header("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        tickers = pd.read_html(html)[0]["Symbol"].astype(str).map(clean_ticker).tolist()
-        tickers = sorted(set([t for t in tickers if t]))
+        df = pd.read_html(io.StringIO(html))[0]
+        tickers = df["Symbol"].astype(str).map(clean_ticker).tolist()
+        tickers = sorted(set(t for t in tickers if t))
         print(f"✅ S&P500 수집 성공: {len(tickers)}개")
         return tickers
     except Exception as e:
@@ -75,12 +67,12 @@ def get_sp500_tickers():
 def get_nasdaq100_tickers():
     try:
         html = get_html_with_header("https://en.wikipedia.org/wiki/Nasdaq-100")
-        df_list = pd.read_html(html, attrs={"id": "constituents"})
-        if not df_list:
+        dfs = pd.read_html(io.StringIO(html), attrs={"id": "constituents"})
+        if not dfs:
             print("❌ Nasdaq100 테이블을 찾지 못했습니다.")
             return []
-        tickers = df_list[0]["Ticker"].astype(str).map(clean_ticker).tolist()
-        tickers = sorted(set([t for t in tickers if t]))
+        tickers = dfs[0]["Ticker"].astype(str).map(clean_ticker).tolist()
+        tickers = sorted(set(t for t in tickers if t))
         print(f"✅ Nasdaq100 수집 성공: {len(tickers)}개")
         return tickers
     except Exception as e:
@@ -88,53 +80,79 @@ def get_nasdaq100_tickers():
         return []
 
 
+def decode_response_text_safely(response):
+    content = response.content
+    # iShares CSV가 UTF-16 또는 NULL byte 포함 형태로 내려오는 경우 대응
+    if content.startswith(b"\xff\xfe") or content.startswith(b"\xfe\xff") or content.count(b"\x00") > max(10, len(content) // 20):
+        for enc in ["utf-16", "utf-16-le", "utf-16-be"]:
+            try:
+                text = content.decode(enc, errors="ignore")
+                if "Ticker" in text and "Name" in text:
+                    return text.replace("\x00", "")
+            except Exception:
+                pass
+    for enc in ["utf-8-sig", "utf-8", "latin1"]:
+        try:
+            text = content.decode(enc, errors="ignore").replace("\x00", "")
+            if text.strip():
+                return text
+        except Exception:
+            pass
+    return response.text.replace("\x00", "")
+
+
+def extract_tickers_from_ishares_csv_text(text):
+    text = text.replace("\x00", "")
+    lines = [line for line in text.splitlines() if line.strip()]
+    start_idx = None
+    for i, line in enumerate(lines):
+        normalized = line.replace('"', '')
+        if "Ticker" in normalized and "Name" in normalized:
+            start_idx = i
+            break
+    if start_idx is None:
+        return []
+    reader = csv.DictReader(io.StringIO("\n".join(lines[start_idx:])))
+    tickers = []
+    for row in reader:
+        ticker = row.get("Ticker", "")
+        if ticker is None:
+            continue
+        ticker = clean_ticker(ticker)
+        if not ticker or ticker in ["-", "Cash", "CASH", "USD"]:
+            continue
+        if " " in ticker or ticker.startswith("RTY") or ticker.startswith("RTYM"):
+            continue
+        if ticker.startswith("The") or "BlackRock" in ticker:
+            break
+        if 1 <= len(ticker) <= 8 and ticker.isascii():
+            tickers.append(ticker)
+    return sorted(set(tickers))
+
+
 def get_russell2000_tickers():
     urls = [
+        "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
         "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM",
         "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv",
     ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/csv,application/csv,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "text/csv,application/csv,text/plain,application/octet-stream,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf",
     }
     for url in urls:
         try:
             print("📥 Russell2000/IWM 보유종목 수집 시도 중...")
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            lines = [line for line in response.text.splitlines() if line.strip()]
-            start_idx = None
-            for i, line in enumerate(lines):
-                if "Ticker" in line and "Name" in line:
-                    start_idx = i
-                    break
-            if start_idx is None:
-                print("⚠️ IWM CSV에서 Ticker 헤더를 찾지 못했습니다.")
-                continue
-            data_text = "\n".join(lines[start_idx:])
-            reader = csv.DictReader(io.StringIO(data_text))
-            tickers = []
-            for row in reader:
-                ticker = row.get("Ticker", "").strip()
-                if not ticker:
-                    continue
-                if ticker in ["-", "Cash", "CASH", "USD"]:
-                    continue
-                if " " in ticker:
-                    continue
-                if ticker.startswith("RTY") or ticker.startswith("RTYM"):
-                    continue
-                if ticker.startswith("The") or "BlackRock" in ticker:
-                    break
-                ticker = clean_ticker(ticker)
-                if 1 <= len(ticker) <= 8:
-                    tickers.append(ticker)
-            tickers = sorted(set(tickers))
+            res = requests.get(url, headers=headers, timeout=40)
+            res.raise_for_status()
+            text = decode_response_text_safely(res)
+            tickers = extract_tickers_from_ishares_csv_text(text)
             if len(tickers) >= 1500:
                 print(f"✅ Russell2000/IWM 티커 수집 성공: {len(tickers)}개")
                 return tickers
-            print(f"⚠️ Russell2000/IWM 티커 수가 비정상적으로 적습니다: {len(tickers)}개")
+            print(f"⚠️ IWM CSV 파싱 결과가 적습니다: {len(tickers)}개, 다음 주소 시도")
         except Exception as e:
             print(f"⚠️ IWM Russell2000 수집 실패: {e}")
     print("❌ Russell2000 티커 수집 최종 실패")
@@ -151,16 +169,15 @@ def get_ticker_dataframe(raw_data, ticker):
             return None
         if "Close" in raw_data.columns:
             return raw_data.copy()
-        return None
     except Exception:
-        return None
+        pass
+    return None
 
 
 def prepare_price_dataframe(df):
     if df is None or df.empty:
         return None
-    required_cols = ["High", "Low", "Close", "Volume"]
-    for col in required_cols:
+    for col in ["High", "Low", "Close", "Volume"]:
         if col not in df.columns:
             return None
     df = df.dropna(subset=["Close"]).copy()
@@ -168,78 +185,57 @@ def prepare_price_dataframe(df):
         return None
     if getattr(df.index, "tz", None) is not None:
         df.index = df.index.tz_localize(None)
-    df["MA50"] = df["Close"].rolling(window=50).mean()
-    df["MA150"] = df["Close"].rolling(window=150).mean()
-    df["MA200"] = df["Close"].rolling(window=200).mean()
-    df["Vol_MA50"] = df["Volume"].rolling(window=50).mean()
-    df["DollarVol_MA50"] = df["Close"].rolling(window=50).mean() * df["Vol_MA50"]
+    df["MA50"] = df["Close"].rolling(50).mean()
+    df["MA150"] = df["Close"].rolling(150).mean()
+    df["MA200"] = df["Close"].rolling(200).mean()
+    df["Vol_MA50"] = df["Volume"].rolling(50).mean()
+    df["DollarVol_MA50"] = df["Close"].rolling(50).mean() * df["Vol_MA50"]
     return df
 
 
-def safe_return(close_series, days):
-    try:
-        if len(close_series) <= days:
-            return None
-        start_price = close_series.iloc[-days]
-        end_price = close_series.iloc[-1]
-        if start_price is None or start_price <= 0:
-            return None
-        return (end_price / start_price) - 1
-    except Exception:
+def safe_return(close, days):
+    if len(close) <= days:
         return None
+    start = close.iloc[-days]
+    end = close.iloc[-1]
+    if start is None or start <= 0:
+        return None
+    return end / start - 1
 
 
-def calculate_rs_scores(price_data_by_ticker):
+def calculate_rs_scores(price_data):
     rows = []
-    for ticker, df in price_data_by_ticker.items():
+    for ticker, df in price_data.items():
         close = df["Close"].dropna()
         r3 = safe_return(close, 63)
         r6 = safe_return(close, 126)
         r12 = safe_return(close, 252)
         if r3 is None or r6 is None or r12 is None:
             continue
-        weighted_return = (r3 * 0.4) + (r6 * 0.3) + (r12 * 0.3)
-        rows.append({"ticker": ticker, "r3": r3, "r6": r6, "r12": r12, "weighted_return": weighted_return})
+        wr = r3 * 0.4 + r6 * 0.3 + r12 * 0.3
+        rows.append({"ticker": ticker, "r3": r3, "r6": r6, "r12": r12, "weighted_return": wr})
     if not rows:
         return {}
     rs_df = pd.DataFrame(rows)
     rs_df["rs_rating"] = (rs_df["weighted_return"].rank(pct=True) * 99).round(0).astype(int)
-    rs_map = {}
-    for _, row in rs_df.iterrows():
-        rs_map[row["ticker"]] = {
-            "rs_rating": int(row["rs_rating"]),
-            "r3": float(row["r3"]),
-            "r6": float(row["r6"]),
-            "r12": float(row["r12"]),
-            "weighted_return": float(row["weighted_return"]),
-        }
-    return rs_map
+    return {r["ticker"]: {"rs_rating": int(r["rs_rating"]), "r3": float(r["r3"]), "r6": float(r["r6"]), "r12": float(r["r12"])} for _, r in rs_df.iterrows()}
 
 
 def passes_market_filter():
     if not MARKET_FILTER_ENABLED:
         return True, "비활성화"
     try:
-        index_data = yf.download(["^GSPC", "^IXIC"], period="1y", interval="1d", group_by="ticker", progress=False, threads=False, timeout=30, auto_adjust=True)
-        status_list = []
-        for index_ticker in ["^GSPC", "^IXIC"]:
-            if isinstance(index_data.columns, pd.MultiIndex):
-                df = index_data[index_ticker].copy()
-            else:
-                df = index_data.copy()
+        data = yf.download(["^GSPC", "^IXIC"], period="1y", interval="1d", group_by="ticker", progress=False, threads=False, timeout=30, auto_adjust=True)
+        oks = []
+        for idx in ["^GSPC", "^IXIC"]:
+            df = data[idx].copy() if isinstance(data.columns, pd.MultiIndex) and idx in data.columns.get_level_values(0) else data.copy()
             df = df.dropna(subset=["Close"]).copy()
             if len(df) < 220:
                 return False, "시장지수 데이터 부족"
             df["MA50"] = df["Close"].rolling(50).mean()
             df["MA200"] = df["Close"].rolling(200).mean()
-            current = df["Close"].iloc[-1]
-            ma50 = df["MA50"].iloc[-1]
-            ma200 = df["MA200"].iloc[-1]
-            ok = current > ma50 and current > ma200 and ma50 > ma200
-            status_list.append(ok)
-        if all(status_list):
-            return True, "양호: S&P500/Nasdaq 모두 상승 추세"
-        return False, "주의: S&P500 또는 Nasdaq 상승 추세 미충족"
+            oks.append(df["Close"].iloc[-1] > df["MA50"].iloc[-1] > df["MA200"].iloc[-1])
+        return (True, "양호: S&P500/Nasdaq 모두 상승 추세") if all(oks) else (False, "주의: S&P500 또는 Nasdaq 상승 추세 미충족")
     except Exception as e:
         print(f"⚠️ 시장 환경 필터 확인 실패: {e}")
         return False, "시장 환경 확인 실패"
@@ -247,138 +243,87 @@ def passes_market_filter():
 
 def passes_trend_template(ticker, df, rs_info):
     try:
-        current_price = df["Close"].iloc[-1]
+        cp = df["Close"].iloc[-1]
         ma50 = df["MA50"].iloc[-1]
         ma150 = df["MA150"].iloc[-1]
         ma200 = df["MA200"].iloc[-1]
-        ma200_22days_ago = df["MA200"].iloc[-22]
-        ma200_44days_ago = df["MA200"].iloc[-44]
-        low_52week = df["Close"].tail(252).min()
-        high_52week = df["Close"].tail(252).max()
+        ma200_22 = df["MA200"].iloc[-22]
+        ma200_44 = df["MA200"].iloc[-44]
+        low52 = df["Close"].tail(252).min()
+        high52 = df["Close"].tail(252).max()
         avg_vol = df["Vol_MA50"].iloc[-1]
-        avg_dollar_vol = df["DollarVol_MA50"].iloc[-1]
-        rs_rating = rs_info.get("rs_rating", 0)
-        values = [current_price, ma50, ma150, ma200, ma200_22days_ago, ma200_44days_ago, low_52week, high_52week, avg_vol, avg_dollar_vol]
-        if any(pd.isna(x) for x in values):
-            return False, {}
-        if not (current_price > ma150 and current_price > ma200):
-            return False, {}
-        if not (ma150 > ma200):
-            return False, {}
-        if not (ma200 > ma200_22days_ago and ma200 > ma200_44days_ago):
-            return False, {}
-        if not (ma50 > ma150 and ma50 > ma200):
-            return False, {}
-        if not (current_price > ma50):
-            return False, {}
-        if not (current_price >= low_52week * 1.30):
-            return False, {}
-        if not (current_price >= high_52week * 0.75):
-            return False, {}
-        if rs_rating < MIN_RS_RATING:
-            return False, {}
-        if avg_vol < MIN_AVG_VOLUME:
-            return False, {}
-        if avg_dollar_vol < MIN_DOLLAR_VOLUME:
-            return False, {}
-        details = {
-            "price": round(current_price, 2),
-            "ma50": round(ma50, 2),
-            "ma150": round(ma150, 2),
-            "ma200": round(ma200, 2),
-            "low_52w": round(low_52week, 2),
-            "high_52w": round(high_52week, 2),
-            "rs_rating": rs_rating,
-            "avg_vol50": int(avg_vol),
-            "avg_dollar_vol50": int(avg_dollar_vol),
-        }
-        return True, details
+        avg_dvol = df["DollarVol_MA50"].iloc[-1]
+        rs = rs_info.get("rs_rating", 0)
+        vals = [cp, ma50, ma150, ma200, ma200_22, ma200_44, low52, high52, avg_vol, avg_dvol]
+        if any(pd.isna(x) for x in vals):
+            return False
+        checks = [
+            cp > ma150 and cp > ma200,
+            ma150 > ma200,
+            ma200 > ma200_22 and ma200 > ma200_44,
+            ma50 > ma150 and ma50 > ma200,
+            cp > ma50,
+            cp >= low52 * 1.30,
+            cp >= high52 * 0.75,
+            rs >= MIN_RS_RATING,
+            avg_vol >= MIN_AVG_VOLUME,
+            avg_dvol >= MIN_DOLLAR_VOLUME,
+        ]
+        return all(checks)
     except Exception as e:
         print(f"⚠️ {ticker} 트렌드 템플릿 오류: {e}")
-        return False, {}
+        return False
 
 
 def get_fundamental_info(ticker):
     try:
         info = yf.Ticker(ticker).info
-        eps_growth = info.get("earningsGrowth", None)
-        rev_growth = info.get("revenueGrowth", None)
-        sector = info.get("sector", "")
-        industry = info.get("industry", "")
-        if eps_growth is None or rev_growth is None:
-            return False, {"eps_growth": None, "rev_growth": None, "sector": sector, "industry": industry, "reason": "실적 데이터 없음"}
-        if eps_growth < MIN_EPS_GROWTH:
-            return False, {"eps_growth": eps_growth, "rev_growth": rev_growth, "sector": sector, "industry": industry, "reason": "EPS 성장률 미달"}
-        if rev_growth < MIN_REV_GROWTH:
-            return False, {"eps_growth": eps_growth, "rev_growth": rev_growth, "sector": sector, "industry": industry, "reason": "매출 성장률 미달"}
-        return True, {"eps_growth": eps_growth, "rev_growth": rev_growth, "sector": sector, "industry": industry, "reason": "통과"}
+        eps = info.get("earningsGrowth")
+        rev = info.get("revenueGrowth")
+        if eps is None or rev is None or eps < MIN_EPS_GROWTH or rev < MIN_REV_GROWTH:
+            return False, {}
+        return True, {"eps_growth": eps, "rev_growth": rev, "sector": info.get("sector", ""), "industry": info.get("industry", "")}
     except Exception as e:
-        return False, {"eps_growth": None, "rev_growth": None, "sector": "", "industry": "", "reason": f"실적 조회 오류: {e}"}
+        print(f"⚠️ {ticker} 실적 조회 오류: {e}")
+        return False, {}
 
 
 def check_vcp_pattern(ticker, df):
     try:
-        if len(df) < 260:
-            return False, {}
         recent = df.tail(65).copy()
         if len(recent) < 65:
             return False, {}
-        seg1 = recent.iloc[0:25]
-        seg2 = recent.iloc[25:45]
-        seg3 = recent.iloc[45:65]
-        def contraction_range(seg):
+        seg1, seg2, seg3 = recent.iloc[0:25], recent.iloc[25:45], recent.iloc[45:65]
+        def cr(seg):
             low = seg["Low"].min()
             high = seg["High"].max()
-            if low <= 0:
-                return None
-            return (high - low) / low
-        r1 = contraction_range(seg1)
-        r2 = contraction_range(seg2)
-        r3 = contraction_range(seg3)
-        if r1 is None or r2 is None or r3 is None:
-            return False, {}
-        if not (r1 > r2 > r3):
-            return False, {}
-        if r3 > VCP_MAX_LAST_CONTRACTION:
+            return None if low <= 0 else (high - low) / low
+        r1, r2, r3 = cr(seg1), cr(seg2), cr(seg3)
+        if r1 is None or r2 is None or r3 is None or not (r1 > r2 > r3) or r3 > VCP_MAX_LAST_CONTRACTION:
             return False, {}
         vol_early = recent["Volume"].iloc[0:30].mean()
         vol_recent = recent["Volume"].iloc[-10:].mean()
         vol_ma50 = df["Vol_MA50"].iloc[-1]
-        if pd.isna(vol_early) or pd.isna(vol_recent) or pd.isna(vol_ma50):
+        if pd.isna(vol_early) or pd.isna(vol_recent) or pd.isna(vol_ma50) or not (vol_recent < vol_early):
             return False, {}
-        if not (vol_recent < vol_early):
-            return False, {}
-        current_price = df["Close"].iloc[-1]
-        current_volume = df["Volume"].iloc[-1]
+        current = df["Close"].iloc[-1]
+        current_vol = df["Volume"].iloc[-1]
         pivot = recent["High"].tail(20).max()
-        recent_low = recent["Low"].tail(20).min()
-        ma50 = df["MA50"].iloc[-1]
-        stop = max(recent_low, ma50 * 0.97)
-        risk_pct = ((pivot - stop) / pivot) * 100
-        if risk_pct <= 0:
+        stop = max(recent["Low"].tail(20).min(), df["MA50"].iloc[-1] * 0.97)
+        risk = (pivot - stop) / pivot * 100
+        if risk <= 0 or risk > MAX_RISK_PCT:
             return False, {}
-        if risk_pct > MAX_RISK_PCT:
+        dist = (pivot - current) / pivot * 100
+        near_pivot = current <= pivot * 1.03 and current >= pivot * (1 - PIVOT_NEAR_PCT / 100)
+        breakout = current > pivot and current_vol >= vol_ma50 * 1.5
+        if not near_pivot and not breakout:
             return False, {}
-        distance_from_pivot = ((pivot - current_price) / pivot) * 100
-        near_pivot = current_price <= pivot * 1.03 and current_price >= pivot * (1 - PIVOT_NEAR_PCT / 100)
-        breakout_today = current_price > pivot and current_volume >= vol_ma50 * 1.5
-        if not near_pivot and not breakout_today:
-            return False, {}
-        setup_type = "BREAKOUT" if breakout_today else "WATCH"
-        details = {
-            "setup_type": setup_type,
-            "entry": round(pivot, 2),
-            "stop": round(stop, 2),
-            "risk": round(risk_pct, 1),
-            "current_price": round(current_price, 2),
-            "distance_from_pivot": round(distance_from_pivot, 1),
-            "vcp_r1": round(r1 * 100, 1),
-            "vcp_r2": round(r2 * 100, 1),
-            "vcp_r3": round(r3 * 100, 1),
-            "vol_decline": round((1 - vol_recent / vol_early) * 100, 1),
-            "breakout_volume_ratio": round(current_volume / vol_ma50, 2),
+        return True, {
+            "setup_type": "BREAKOUT" if breakout else "WATCH",
+            "current_price": round(current, 2), "entry": round(pivot, 2), "stop": round(stop, 2), "risk": round(risk, 1),
+            "distance_from_pivot": round(dist, 1), "vcp_r1": round(r1 * 100, 1), "vcp_r2": round(r2 * 100, 1), "vcp_r3": round(r3 * 100, 1),
+            "vol_decline": round((1 - vol_recent / vol_early) * 100, 1), "breakout_volume_ratio": round(current_vol / vol_ma50, 2)
         }
-        return True, details
     except Exception as e:
         print(f"⚠️ {ticker} VCP 검사 오류: {e}")
         return False, {}
@@ -395,27 +340,21 @@ def main():
     if len(ru_list) == 0:
         print("⚠️ 경고: Russell2000 수집 실패. S&P500 + Nasdaq100만 스크리닝합니다.")
     if not tickers:
-        print("❌ 에러: 종목 명단을 전혀 수집하지 못해 프로그램을 종료합니다.")
         sys.exit(1)
 
     print("🌎 2. 시장 환경 필터 확인...")
     market_ok, market_status = passes_market_filter()
     print(f"📌 시장 환경: {market_status}")
-    if MARKET_FILTER_ENABLED and not market_ok:
-        print("⚠️ 시장 환경이 좋지 않습니다. 후보는 계산하지만 메시지에 경고를 표시합니다.")
 
     print("📥 3. 주가 데이터 분할 다운로드 시작...")
     raw_data = pd.DataFrame()
     for i in range(0, len(tickers), CHUNK_SIZE):
-        chunk_tickers = tickers[i:i + CHUNK_SIZE]
-        print(f"   ↳ 다운로드 중... [{i + 1}~{min(i + CHUNK_SIZE, len(tickers))}/{len(tickers)}] ({len(chunk_tickers)}개 종목)")
+        chunk = tickers[i:i + CHUNK_SIZE]
+        print(f"   ↳ 다운로드 중... [{i + 1}~{min(i + CHUNK_SIZE, len(tickers))}/{len(tickers)}] ({len(chunk)}개 종목)")
         try:
-            chunk_data = yf.download(chunk_tickers, period=PRICE_PERIOD, interval="1d", group_by="ticker", progress=False, threads=False, timeout=30, auto_adjust=True)
-            if chunk_data is not None and not chunk_data.empty:
-                if raw_data.empty:
-                    raw_data = chunk_data
-                else:
-                    raw_data = pd.concat([raw_data, chunk_data], axis=1)
+            cd = yf.download(chunk, period=PRICE_PERIOD, interval="1d", group_by="ticker", progress=False, threads=False, timeout=30, auto_adjust=True)
+            if cd is not None and not cd.empty:
+                raw_data = cd if raw_data.empty else pd.concat([raw_data, cd], axis=1)
         except Exception as e:
             print(f"⚠️ 일부 청크 다운로드 실패: {e}")
         time.sleep(SLEEP_BETWEEN_CHUNKS)
@@ -424,110 +363,74 @@ def main():
         sys.exit(1)
 
     print("🧮 4. 종목별 가격 데이터 정리 및 RS Rating 계산...")
-    price_data_by_ticker = {}
-    for ticker in tickers:
-        df = get_ticker_dataframe(raw_data, ticker)
-        df = prepare_price_dataframe(df)
+    price_data = {}
+    for t in tickers:
+        df = prepare_price_dataframe(get_ticker_dataframe(raw_data, t))
         if df is not None:
-            price_data_by_ticker[ticker] = df
-    print(f"✅ 유효 가격 데이터 확보: {len(price_data_by_ticker)}개")
-    if not price_data_by_ticker:
-        print("❌ 유효한 가격 데이터가 없습니다.")
-        sys.exit(1)
-    rs_map = calculate_rs_scores(price_data_by_ticker)
+            price_data[t] = df
+    print(f"✅ 유효 가격 데이터 확보: {len(price_data)}개")
+    rs_map = calculate_rs_scores(price_data)
     print(f"✅ RS Rating 계산 완료: {len(rs_map)}개")
 
     print("📈 5. 미너비니 트렌드 템플릿 필터 가동...")
-    passed_trend = []
-    for ticker, df in price_data_by_ticker.items():
-        rs_info = rs_map.get(ticker, {"rs_rating": 0})
-        passed, trend_details = passes_trend_template(ticker, df, rs_info)
-        if passed:
-            passed_trend.append((ticker, df, trend_details, rs_info))
-            print(f"✅ 트렌드 템플릿 통과: {ticker} | RS {rs_info.get('rs_rating', 0)}")
-    print(f"🎯 트렌드 템플릿 통과: {len(passed_trend)}개 종목")
+    passed = []
+    for t, df in price_data.items():
+        rs = rs_map.get(t, {"rs_rating": 0})
+        if passes_trend_template(t, df, rs):
+            passed.append((t, df, rs))
+            print(f"✅ 트렌드 템플릿 통과: {t} | RS {rs.get('rs_rating', 0)}")
+    print(f"🎯 트렌드 템플릿 통과: {len(passed)}개 종목")
 
     print("🧬 6. 펀더멘탈 필터 및 VCP 검사 시작...")
-    final_targets = []
-    for idx, item in enumerate(passed_trend, start=1):
-        ticker, df, trend_details, rs_info = item
-        try:
-            print(f"   ↳ [{idx}/{len(passed_trend)}] {ticker} 실적/VCP 검사 중...")
-            fundamental_ok, fundamental = get_fundamental_info(ticker)
-            if not fundamental_ok:
-                time.sleep(0.4)
-                continue
-            vcp_ok, vcp_details = check_vcp_pattern(ticker, df)
-            if not vcp_ok:
-                time.sleep(0.4)
-                continue
-            target = {
-                "ticker": ticker,
-                "setup_type": vcp_details["setup_type"],
-                "current_price": vcp_details["current_price"],
-                "entry": vcp_details["entry"],
-                "stop": vcp_details["stop"],
-                "risk": vcp_details["risk"],
-                "distance_from_pivot": vcp_details["distance_from_pivot"],
-                "rs_rating": rs_info.get("rs_rating", 0),
-                "r3_return_pct": round(rs_info.get("r3", 0) * 100, 1),
-                "r6_return_pct": round(rs_info.get("r6", 0) * 100, 1),
-                "r12_return_pct": round(rs_info.get("r12", 0) * 100, 1),
-                "eps_growth_pct": round(fundamental["eps_growth"] * 100, 1),
-                "rev_growth_pct": round(fundamental["rev_growth"] * 100, 1),
-                "sector": fundamental.get("sector", ""),
-                "industry": fundamental.get("industry", ""),
-                "vcp_r1_pct": vcp_details["vcp_r1"],
-                "vcp_r2_pct": vcp_details["vcp_r2"],
-                "vcp_r3_pct": vcp_details["vcp_r3"],
-                "vol_decline_pct": vcp_details["vol_decline"],
-                "breakout_volume_ratio": vcp_details["breakout_volume_ratio"],
-            }
-            final_targets.append(target)
-            print(f"🔥 최종 통과: {ticker} | {target['setup_type']} | RS {target['rs_rating']} | Risk {target['risk']}%")
+    final = []
+    for idx, (t, df, rs) in enumerate(passed, start=1):
+        print(f"   ↳ [{idx}/{len(passed)}] {t} 실적/VCP 검사 중...")
+        ok_f, f = get_fundamental_info(t)
+        if not ok_f:
             time.sleep(0.4)
-        except Exception as e:
-            print(f"⚠️ {ticker} 최종 검사 중 오류: {e}")
+            continue
+        ok_v, v = check_vcp_pattern(t, df)
+        if not ok_v:
             time.sleep(0.4)
+            continue
+        item = {
+            "ticker": t, "setup_type": v["setup_type"], "current_price": v["current_price"], "entry": v["entry"], "stop": v["stop"], "risk": v["risk"],
+            "distance_from_pivot": v["distance_from_pivot"], "rs_rating": rs.get("rs_rating", 0),
+            "r3_return_pct": round(rs.get("r3", 0) * 100, 1), "r6_return_pct": round(rs.get("r6", 0) * 100, 1), "r12_return_pct": round(rs.get("r12", 0) * 100, 1),
+            "eps_growth_pct": round(f["eps_growth"] * 100, 1), "rev_growth_pct": round(f["rev_growth"] * 100, 1), "sector": f.get("sector", ""), "industry": f.get("industry", ""),
+            "vcp_r1_pct": v["vcp_r1"], "vcp_r2_pct": v["vcp_r2"], "vcp_r3_pct": v["vcp_r3"], "vol_decline_pct": v["vol_decline"], "breakout_volume_ratio": v["breakout_volume_ratio"]
+        }
+        final.append(item)
+        print(f"🔥 최종 통과: {t} | {item['setup_type']} | RS {item['rs_rating']} | Risk {item['risk']}%")
+        time.sleep(0.4)
 
-    final_targets = sorted(final_targets, key=lambda x: (0 if x["setup_type"] == "BREAKOUT" else 1, -x["rs_rating"], abs(x["distance_from_pivot"])))
-    print(f"🔥 최종 미너비니 후보: {len(final_targets)}개")
+    final = sorted(final, key=lambda x: (0 if x["setup_type"] == "BREAKOUT" else 1, -x["rs_rating"], abs(x["distance_from_pivot"])))
+    today = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d")
+    cols = ["ticker", "setup_type", "current_price", "entry", "stop", "risk", "distance_from_pivot", "rs_rating", "r3_return_pct", "r6_return_pct", "r12_return_pct", "eps_growth_pct", "rev_growth_pct", "sector", "industry", "vcp_r1_pct", "vcp_r2_pct", "vcp_r3_pct", "vol_decline_pct", "breakout_volume_ratio"]
+    pd.DataFrame(final, columns=cols).to_csv(f"minervini_result_{today}.csv", index=False)
+    print(f"🔥 최종 미너비니 후보: {len(final)}개")
 
-    today_str = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d")
-    result_file = f"minervini_result_{today_str}.csv"
-    result_columns = ["ticker", "setup_type", "current_price", "entry", "stop", "risk", "distance_from_pivot", "rs_rating", "r3_return_pct", "r6_return_pct", "r12_return_pct", "eps_growth_pct", "rev_growth_pct", "sector", "industry", "vcp_r1_pct", "vcp_r2_pct", "vcp_r3_pct", "vol_decline_pct", "breakout_volume_ratio"]
-    if final_targets:
-        pd.DataFrame(final_targets)[result_columns].to_csv(result_file, index=False)
-        print(f"💾 결과 CSV 저장 완료: {result_file}")
-    else:
-        pd.DataFrame(columns=result_columns).to_csv(result_file, index=False)
-        print(f"💾 빈 결과 CSV 저장 완료: {result_file}")
-
-    russell_status = "성공" if len(ru_list) > 0 else "실패"
-    if final_targets:
-        display_targets = final_targets[:15]
-        target_text = "\n".join([
-            f"• {item['ticker']} [{item['setup_type']}]\n"
-            f"  현재가 {item['current_price']}$ | 진입가 {item['entry']}$ | 손절가 {item['stop']}$ | 리스크 -{item['risk']}%\n"
-            f"  RS {item['rs_rating']} | EPS {item['eps_growth_pct']}% | 매출 {item['rev_growth_pct']}% | 피벗거리 {item['distance_from_pivot']}%"
-            for item in display_targets
-        ])
-        if len(final_targets) > 15:
-            target_text += f"\n\n외 {len(final_targets) - 15}개 후보는 CSV에서 확인하세요."
+    if final:
+        lines = []
+        for item in final[:15]:
+            lines.append(f"• {item['ticker']} [{item['setup_type']}]\n  현재가 {item['current_price']}$ | 진입가 {item['entry']}$ | 손절가 {item['stop']}$ | 리스크 -{item['risk']}%\n  RS {item['rs_rating']} | EPS {item['eps_growth_pct']}% | 매출 {item['rev_growth_pct']}% | 피벗거리 {item['distance_from_pivot']}%")
+        target_text = "\n".join(lines)
+        if len(final) > 15:
+            target_text += f"\n\n외 {len(final)-15}개 후보는 CSV에서 확인하세요."
     else:
         target_text = "조건을 모두 만족하는 미너비니 후보가 없습니다."
 
     msg = (
-        f"🔔 [{today_str}] 미너비니 정밀 스크리닝 결과\n"
+        f"🔔 [{today}] 미너비니 정밀 스크리닝 결과\n"
         f"------------------------------------\n"
         f"📊 S&P500: {len(sp_list)}개\n"
         f"📊 Nasdaq100: {len(nd_list)}개\n"
-        f"📊 Russell2000/IWM: {len(ru_list)}개, 수집상태: {russell_status}\n"
+        f"📊 Russell2000/IWM: {len(ru_list)}개, 수집상태: {'성공' if ru_list else '실패'}\n"
         f"🚀 총 스캔 대상: {len(tickers)}개\n"
         f"🌎 시장 환경: {market_status}\n"
-        f"📈 유효 가격 데이터: {len(price_data_by_ticker)}개\n"
-        f"✅ 트렌드 템플릿 통과: {len(passed_trend)}개\n"
-        f"🔥 최종 실적+VCP 통과: {len(final_targets)}개\n\n"
+        f"📈 유효 가격 데이터: {len(price_data)}개\n"
+        f"✅ 트렌드 템플릿 통과: {len(passed)}개\n"
+        f"🔥 최종 실적+VCP 통과: {len(final)}개\n\n"
         f"{target_text}\n"
         f"------------------------------------\n"
         f"※ 투자 추천이 아닌 자동 선별 결과입니다.\n"
