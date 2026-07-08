@@ -2,11 +2,10 @@ name: Minervini Auto Screener
 
 on:
   schedule:
-    # 한국시간 화~토 06:30 실행
-    # GitHub Actions cron은 UTC 기준입니다.
-    # 21:30 UTC = 한국시간 다음날 06:30
-    # 미국 월~금 정규장 종료 후 실행됩니다.
-    - cron: '30 21 * * 1-5'
+    # 한국시간 화~토 06:37 실행
+    # GitHub Actions cron은 UTC 기준
+    # 21:37 UTC = 한국시간 다음날 06:37
+    - cron: '37 21 * * 1-5'
 
   workflow_dispatch:
 
@@ -20,7 +19,7 @@ concurrency:
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       PYTHONUNBUFFERED: "1"
@@ -40,7 +39,8 @@ jobs:
         run: python -m pip install --upgrade pip
 
       - name: Install dependencies
-        run: pip install yfinance pandas requests lxml beautifulsoup4 html5lib
+        run: |
+          pip install yfinance pandas requests lxml beautifulsoup4 html5lib
 
       - name: Run Screener
         env:
