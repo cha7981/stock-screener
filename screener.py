@@ -13,7 +13,7 @@ import yfinance as yf
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# ===== 미너비니 조건 =====
+# ===== Minervini / Screener Settings =====
 MIN_RS_RATING = 70
 MIN_AVG_VOLUME = 150000
 MIN_DOLLAR_VOLUME = 2000000
@@ -23,14 +23,13 @@ MAX_RISK_PCT = 8.0
 PIVOT_NEAR_PCT = 5.0
 VCP_MAX_LAST_CONTRACTION = 0.08
 
-# ===== 안정성 설정 =====
 PRICE_PERIOD = "18mo"
-CHUNK_SIZE = 50              # 기존 150개 -> 50개로 축소해 yfinance rate limit 완화
-SLEEP_BETWEEN_CHUNKS = 8     # 기존 2초 -> 8초로 증가
-FUNDAMENTAL_SLEEP = 3        # yfinance.info 호출 간격
-FUNDAMENTAL_RETRY_SLEEP = 45 # 실적 조회 rate limit 발생 시 대기
-MAX_FUNDAMENTAL_CALLS = 40   # VCP 통과 후보 중 실적 조회 최대 개수
-MARKET_FILTER_ENABLED = False # Yahoo SSL 문제 방지를 위해 기본 비활성화. 필요 시 True로 변경.
+CHUNK_SIZE = 50
+SLEEP_BETWEEN_CHUNKS = 8
+FUNDAMENTAL_SLEEP = 3
+FUNDAMENTAL_RETRY_SLEEP = 45
+MAX_FUNDAMENTAL_CALLS = 40
+MARKET_FILTER_ENABLED = False
 
 
 def send_telegram_message(message):
@@ -49,9 +48,7 @@ def send_telegram_message(message):
 def clean_ticker(ticker):
     if ticker is None:
         return ""
-    ticker = str(ticker).strip().replace("\ufeff", "").replace('"', "")
-    ticker = ticker.replace(".", "-")
-    return ticker
+    return str(ticker).strip().replace("\ufeff", "").replace('"', "").replace(".", "-")
 
 
 def is_valid_us_ticker(ticker):
@@ -63,13 +60,12 @@ def is_valid_us_ticker(ticker):
         return False
     if " " in ticker or len(ticker) > 8:
         return False
-    # 해외거래소 접미사/비정상 심볼 제거. MOG-A 같은 클래스 주식은 허용.
     bad_suffixes = ("-TO", "-OL", "-DE", "-L", "-PA", "-AS", "-SW", "-VI", "-F")
     if ticker.endswith(bad_suffixes):
         return False
     if ticker.startswith("RTY") or ticker.startswith("RTYM"):
         return False
-    if re.search(r"\d{3,}", ticker):  # P5N994 같은 이상값 제거
+    if re.search(r"\d{3,}", ticker):
         return False
     return bool(re.match(r"^[A-Z][A-Z0-9]*(?:-[A-Z])?$", ticker))
 
@@ -349,17 +345,45 @@ def check_vcp_pattern(ticker, df):
             return False, {}
         return True, {
             "setup_type": "BREAKOUT" if breakout else "WATCH",
-            "current_price": round(current, 2), "entry": round(pivot, 2), "stop": round(stop, 2), "risk": round(risk, 1),
-            "distance_from_pivot": round(dist, 1), "vcp_r1": round(r1 * 100, 1), "vcp_r2": round(r2 * 100, 1), "vcp_r3": round(r3 * 100, 1),
-            "vol_decline": round((1 - vol_recent / vol_early) * 100, 1), "breakout_volume_ratio": round(current_vol / vol_ma50, 2)
+            "current_price": round(current, 2),
+            "entry": round(pivot, 2),
+            "stop": round(stop, 2),
+            "risk": round(risk, 1),
+            "distance_from_pivot": round(dist, 1),
+            "vcp_r1": round(r1 * 100, 1),
+            "vcp_r2": round(r2 * 100, 1),
+            "vcp_r3": round(r3 * 100, 1),
+            "vol_decline": round((1 - vol_recent / vol_early) * 100, 1),
+            "breakout_volume_ratio": round(current_vol / vol_ma50, 2),
         }
     except Exception as e:
         print(f"⚠️ {ticker} VCP 검사 오류: {e}")
         return False, {}
 
 
+def build_fundamental_reason(status, eps, rev, raw_reason):
+    eps_txt = "없음" if eps is None else f"{eps * 100:.1f}%"
+    rev_txt = "없음" if rev is None else f"{rev * 100:.1f}%"
+    eps_req = f"{MIN_EPS_GROWTH * 100:.0f}%"
+    rev_req = f"{MIN_REV_GROWTH * 100:.0f}%"
+    if status == "PASS":
+        return f"통과: EPS {eps_txt} ≥ {eps_req}, 매출 {rev_txt} ≥ {rev_req}"
+    if status == "FAIL":
+        fail_parts = []
+        if eps is None:
+            fail_parts.append(f"EPS 데이터 없음, 기준 {eps_req}")
+        elif eps < MIN_EPS_GROWTH:
+            fail_parts.append(f"EPS {eps_txt} < 기준 {eps_req}")
+        if rev is None:
+            fail_parts.append(f"매출 데이터 없음, 기준 {rev_req}")
+        elif rev < MIN_REV_GROWTH:
+            fail_parts.append(f"매출 {rev_txt} < 기준 {rev_req}")
+        return "미통과: " + "; ".join(fail_parts)
+    return f"미확인: {raw_reason}; EPS {eps_txt}, 매출 {rev_txt}"
+
+
 def get_fundamental_info(ticker):
-    """VCP까지 통과한 소수 종목에만 호출. 실패 시 미확인으로 처리."""
+    """VCP까지 통과한 소수 종목에만 호출. 실패/미달 사유를 상세 반환."""
     for attempt in range(2):
         try:
             info = yf.Ticker(ticker).info
@@ -368,18 +392,23 @@ def get_fundamental_info(ticker):
             sector = info.get("sector", "")
             industry = info.get("industry", "")
             if eps is None or rev is None:
-                return "UNKNOWN", {"eps_growth": None, "rev_growth": None, "sector": sector, "industry": industry, "reason": "실적 데이터 없음"}
+                reason = build_fundamental_reason("UNKNOWN", eps, rev, "yfinance 실적 데이터 없음")
+                return "UNKNOWN", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": reason}
             if eps >= MIN_EPS_GROWTH and rev >= MIN_REV_GROWTH:
-                return "PASS", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": "통과"}
-            return "FAIL", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": "성장률 미달"}
+                reason = build_fundamental_reason("PASS", eps, rev, "")
+                return "PASS", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": reason}
+            reason = build_fundamental_reason("FAIL", eps, rev, "성장률 기준 미달")
+            return "FAIL", {"eps_growth": eps, "rev_growth": rev, "sector": sector, "industry": industry, "reason": reason}
         except Exception as e:
             msg = str(e)
             if "Too Many Requests" in msg or "Rate limited" in msg:
                 print(f"⚠️ {ticker} 실적 조회 rate limit, {FUNDAMENTAL_RETRY_SLEEP}초 대기 후 재시도")
                 time.sleep(FUNDAMENTAL_RETRY_SLEEP)
                 continue
-            return "UNKNOWN", {"eps_growth": None, "rev_growth": None, "sector": "", "industry": "", "reason": f"실적 조회 오류: {e}"}
-    return "UNKNOWN", {"eps_growth": None, "rev_growth": None, "sector": "", "industry": "", "reason": "rate limit으로 실적 미확인"}
+            reason = build_fundamental_reason("UNKNOWN", None, None, f"실적 조회 오류: {e}")
+            return "UNKNOWN", {"eps_growth": None, "rev_growth": None, "sector": "", "industry": "", "reason": reason}
+    reason = build_fundamental_reason("UNKNOWN", None, None, "rate limit으로 실적 미확인")
+    return "UNKNOWN", {"eps_growth": None, "rev_growth": None, "sector": "", "industry": "", "reason": reason}
 
 
 def main():
@@ -444,37 +473,71 @@ def main():
     for idx, (t, df, rs, v) in enumerate(vcp_candidates[:MAX_FUNDAMENTAL_CALLS], start=1):
         print(f"   ↳ [{idx}/{min(len(vcp_candidates), MAX_FUNDAMENTAL_CALLS)}] {t} 실적 조회")
         status, f = get_fundamental_info(t)
+        eps_pct = None if f.get("eps_growth") is None else round(f["eps_growth"] * 100, 1)
+        rev_pct = None if f.get("rev_growth") is None else round(f["rev_growth"] * 100, 1)
         base = {
-            "ticker": t, "setup_type": v["setup_type"], "fundamental_status": status, "fundamental_reason": f.get("reason", ""),
-            "current_price": v["current_price"], "entry": v["entry"], "stop": v["stop"], "risk": v["risk"],
-            "distance_from_pivot": v["distance_from_pivot"], "rs_rating": rs.get("rs_rating", 0),
-            "r3_return_pct": round(rs.get("r3", 0) * 100, 1), "r6_return_pct": round(rs.get("r6", 0) * 100, 1), "r12_return_pct": round(rs.get("r12", 0) * 100, 1),
-            "eps_growth_pct": None if f.get("eps_growth") is None else round(f["eps_growth"] * 100, 1),
-            "rev_growth_pct": None if f.get("rev_growth") is None else round(f["rev_growth"] * 100, 1),
-            "sector": f.get("sector", ""), "industry": f.get("industry", ""),
-            "vcp_r1_pct": v["vcp_r1"], "vcp_r2_pct": v["vcp_r2"], "vcp_r3_pct": v["vcp_r3"],
-            "vol_decline_pct": v["vol_decline"], "breakout_volume_ratio": v["breakout_volume_ratio"]
+            "ticker": t,
+            "setup_type": v["setup_type"],
+            "fundamental_status": status,
+            "fundamental_reason": f.get("reason", ""),
+            "current_price": v["current_price"],
+            "entry": v["entry"],
+            "stop": v["stop"],
+            "risk": v["risk"],
+            "distance_from_pivot": v["distance_from_pivot"],
+            "rs_rating": rs.get("rs_rating", 0),
+            "r3_return_pct": round(rs.get("r3", 0) * 100, 1),
+            "r6_return_pct": round(rs.get("r6", 0) * 100, 1),
+            "r12_return_pct": round(rs.get("r12", 0) * 100, 1),
+            "eps_growth_pct": eps_pct,
+            "rev_growth_pct": rev_pct,
+            "sector": f.get("sector", ""),
+            "industry": f.get("industry", ""),
+            "vcp_r1_pct": v["vcp_r1"],
+            "vcp_r2_pct": v["vcp_r2"],
+            "vcp_r3_pct": v["vcp_r3"],
+            "vol_decline_pct": v["vol_decline"],
+            "breakout_volume_ratio": v["breakout_volume_ratio"],
         }
         if status == "PASS":
             final.append(base)
         else:
             tech_only.append(base)
+        print(f"      실적결과: {status} | {base['fundamental_reason']}")
         time.sleep(FUNDAMENTAL_SLEEP + random.uniform(0, 1))
 
-    # 실적 조회 제한에 걸려 조회하지 못한 VCP 후보도 기술 후보로 저장
     for t, df, rs, v in vcp_candidates[MAX_FUNDAMENTAL_CALLS:]:
         tech_only.append({
-            "ticker": t, "setup_type": v["setup_type"], "fundamental_status": "NOT_CHECKED", "fundamental_reason": "실적 조회 호출 제한으로 미확인",
-            "current_price": v["current_price"], "entry": v["entry"], "stop": v["stop"], "risk": v["risk"],
-            "distance_from_pivot": v["distance_from_pivot"], "rs_rating": rs.get("rs_rating", 0),
-            "r3_return_pct": round(rs.get("r3", 0) * 100, 1), "r6_return_pct": round(rs.get("r6", 0) * 100, 1), "r12_return_pct": round(rs.get("r12", 0) * 100, 1),
-            "eps_growth_pct": None, "rev_growth_pct": None, "sector": "", "industry": "",
-            "vcp_r1_pct": v["vcp_r1"], "vcp_r2_pct": v["vcp_r2"], "vcp_r3_pct": v["vcp_r3"],
-            "vol_decline_pct": v["vol_decline"], "breakout_volume_ratio": v["breakout_volume_ratio"]
+            "ticker": t,
+            "setup_type": v["setup_type"],
+            "fundamental_status": "NOT_CHECKED",
+            "fundamental_reason": "실적 조회 호출 제한으로 미확인",
+            "current_price": v["current_price"],
+            "entry": v["entry"],
+            "stop": v["stop"],
+            "risk": v["risk"],
+            "distance_from_pivot": v["distance_from_pivot"],
+            "rs_rating": rs.get("rs_rating", 0),
+            "r3_return_pct": round(rs.get("r3", 0) * 100, 1),
+            "r6_return_pct": round(rs.get("r6", 0) * 100, 1),
+            "r12_return_pct": round(rs.get("r12", 0) * 100, 1),
+            "eps_growth_pct": None,
+            "rev_growth_pct": None,
+            "sector": "",
+            "industry": "",
+            "vcp_r1_pct": v["vcp_r1"],
+            "vcp_r2_pct": v["vcp_r2"],
+            "vcp_r3_pct": v["vcp_r3"],
+            "vol_decline_pct": v["vol_decline"],
+            "breakout_volume_ratio": v["breakout_volume_ratio"],
         })
 
     today = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d")
-    cols = ["ticker", "setup_type", "fundamental_status", "fundamental_reason", "current_price", "entry", "stop", "risk", "distance_from_pivot", "rs_rating", "r3_return_pct", "r6_return_pct", "r12_return_pct", "eps_growth_pct", "rev_growth_pct", "sector", "industry", "vcp_r1_pct", "vcp_r2_pct", "vcp_r3_pct", "vol_decline_pct", "breakout_volume_ratio"]
+    cols = [
+        "ticker", "setup_type", "fundamental_status", "fundamental_reason", "current_price", "entry", "stop", "risk", "distance_from_pivot",
+        "rs_rating", "r3_return_pct", "r6_return_pct", "r12_return_pct", "eps_growth_pct", "rev_growth_pct", "sector", "industry",
+        "vcp_r1_pct", "vcp_r2_pct", "vcp_r3_pct", "vol_decline_pct", "breakout_volume_ratio"
+    ]
     strict_file = f"minervini_strict_{today}.csv"
     watch_file = f"minervini_watchlist_{today}.csv"
     pd.DataFrame(final, columns=cols).to_csv(strict_file, index=False)
@@ -488,15 +551,19 @@ def main():
             return f"{title}: 없음"
         lines = [title]
         for item in items[:limit]:
+            reason = item.get("fundamental_reason", "")
+            if len(reason) > 90:
+                reason = reason[:87] + "..."
             lines.append(
-                f"• {item['ticker']} [{item['setup_type']}] 현재 {item['current_price']}$ | 진입 {item['entry']}$ | 손절 {item['stop']}$ | 리스크 {item['risk']}% | RS {item['rs_rating']} | 실적 {item['fundamental_status']}"
+                f"• {item['ticker']} [{item['setup_type']}] 현재 {item['current_price']}$ | 진입 {item['entry']}$ | 손절 {item['stop']}$ | 리스크 {item['risk']}% | RS {item['rs_rating']}\n"
+                f"  실적: {item['fundamental_status']} | 사유: {reason}"
             )
         if len(items) > limit:
             lines.append(f"외 {len(items)-limit}개는 CSV 확인")
         return "\n".join(lines)
 
     msg = (
-        f"🔔 [{today}] 미너비니 정밀 스크리닝 결과 v4\n"
+        f"🔔 [{today}] 미너비니 정밀 스크리닝 결과 v5\n"
         f"------------------------------------\n"
         f"📊 S&P500: {len(sp_list)}개 | Nasdaq100: {len(nd_list)}개 | Russell2000: {len(ru_list)}개\n"
         f"🚀 총 스캔 대상: {len(tickers)}개\n"
@@ -510,7 +577,7 @@ def main():
         f"{format_items(tech_only, '👀 Watch 후보')}\n"
         f"------------------------------------\n"
         f"※ 투자 추천이 아닌 자동 선별 결과입니다.\n"
-        f"※ v4는 yfinance rate limit 방지를 위해 VCP 검사 후 실적을 조회합니다."
+        f"※ v5는 Watch 후보에 실적 미통과/미확인 사유를 표시합니다."
     )
     send_telegram_message(msg)
     print("🎯 전체 스크리닝 완료")
