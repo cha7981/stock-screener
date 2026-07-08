@@ -9,39 +9,55 @@ CHAT_ID = os.environ.get("CHAT_ID")
 
 def send_telegram_message(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ 에러: 환경변수 세팅을 확인하세요.")
+        print("❌ 에러: 환경변수 세팅(Secrets)을 확인하세요.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload)
-    except Exception as e: print(f"텔레그램 전송 에러: {e}")
+    try: 
+        res = requests.post(url, json=payload)
+        print(f"텔레그램 전송 시도 상태코드: {res.status_code}")
+    except Exception as e: 
+        print(f"텔레그램 전송 에러: {e}")
 
 def get_sp500_tickers():
-    try: return pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].str.replace('.', '-', regex=False).tolist()
-    except: return []
+    try: 
+        return pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]['Symbol'].str.replace('.', '-', regex=False).tolist()
+    except Exception as e:
+        print(f"S&P 500 수집 건너뜀 (사유: {e})")
+        return []
 
 def get_nasdaq100_tickers():
-    try: return pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100', attrs={'id': 'constituents'})[0]['Ticker'].str.replace('.', '-', regex=False).tolist()
-    except: return []
+    try: 
+        return pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100', attrs={'id': 'constituents'})[0]['Ticker'].str.replace('.', '-', regex=False).tolist()
+    except Exception as e:
+        print(f"나스닥 100 수집 건너뜀 (사유: {e})")
+        return []
 
 def get_russell2000_tickers():
     try:
         df = pd.read_csv("https://raw.githubusercontent.com/SergioIommi/Quant-Trading-Dashboards/master/RUT.csv")
         tickers = df['Symbol'].dropna().tolist() if 'Symbol' in df.columns else df.iloc[:, 0].dropna().tolist()
         return [str(t).strip().replace('.', '-') for t in tickers]
-    except: return []
+    except Exception as e:
+        print(f"러셀 2000 수집 건너뜀 (사유: {e})")
+        return []
 
 def check_trend_and_rs(df, spy_close_series):
     if len(df) < 200: return False
+    
     df['MA50'] = df['Close'].rolling(window=50).mean()
     df['MA150'] = df['Close'].rolling(window=150).mean()
     df['MA200'] = df['Close'].rolling(window=200).mean()
     df['Vol_MA50'] = df['Volume'].rolling(window=50).mean()
     
     current_price = df['Close'].iloc[-1]
-    ma50, ma150, ma200 = df['MA50'].iloc[-1], df['MA150'].iloc[-1], df['MA200'].iloc[-1]
+    ma50 = df['MA50'].iloc[-1]
+    ma150 = df['MA150'].iloc[-1]
+    ma200 = df['MA200'].iloc[-1]
     ma200_20days_ago = df['MA200'].iloc[-20]
-    low_52week, high_52week = df['Close'].min(), df['Close'].max()
+    
+    low_52week = df['Close'].min()
+    high_52week = df['Close'].max()
     
     cond_1 = current_price > ma150 and current_price > ma200
     cond_2 = ma150 > ma200
@@ -52,18 +68,30 @@ def check_trend_and_rs(df, spy_close_series):
     cond_7 = current_price >= (high_52week * 0.75)
     cond_vol_base = df['Vol_MA50'].iloc[-1] > 150000
     
-    combined = pd.DataFrame({'Stock': df['Close'], 'SPY': spy_close_series}).dropna()
-    if len(combined) < 50: return False
-    combined['RS_Line'] = combined['Stock'] / combined['SPY']
-    combined['RS_MA50'] = combined['RS_Line'].rolling(window=50).mean()
-    cond_rs = combined['RS_Line'].iloc[-1] > combined['RS_MA50'].iloc[-1]
-    
+    # [안전장치] 지수 데이터가 없거나 에러가 나면 RS 필터는 자동으로 참(True) 처리하여 통과시킵니다.
+    if spy_close_series is None or spy_close_series.empty:
+        cond_rs = True
+    else:
+        try:
+            combined = pd.DataFrame({'Stock': df['Close'], 'SPY': spy_close_series}).dropna()
+            if len(combined) < 50: 
+                cond_rs = False
+            else:
+                combined['RS_Line'] = combined['Stock'] / combined['SPY']
+                combined['RS_MA50'] = combined['RS_Line'].rolling(window=50).mean()
+                cond_rs = combined['RS_Line'].iloc[-1] > combined['RS_MA50'].iloc[-1]
+        except:
+            cond_rs = True
+            
     return cond_1 and cond_2 and cond_3 and cond_4 and cond_5 and cond_6 and cond_7 and cond_rs and cond_vol_base
 
 def check_vcp_and_get_prices(df):
     try:
         recent_df = df.tail(30).copy()
-        seg1, seg2, seg3 = recent_df.iloc[0:10], recent_df.iloc[10:20], recent_df.iloc[20:30]
+        seg1 = recent_df.iloc[0:10]
+        seg2 = recent_df.iloc[10:20]
+        seg3 = recent_df.iloc[20:30]
+        
         range1 = (seg1['High'].max() - seg1['Low'].min()) / seg1['Low'].min()
         range2 = (seg2['High'].max() - seg2['Low'].min()) / seg2['Low'].min()
         range3 = (seg3['High'].max() - seg3['Low'].min()) / seg3['Low'].min()
@@ -78,25 +106,49 @@ def check_vcp_and_get_prices(df):
     return False, 0, 0, 0
 
 if __name__ == "__main__":
-    spy_close = yf.Ticker("^GSPC").history(period="1y")['Close']
+    print("📊 1. 기준 지수 데이터 다운로드 시도...")
+    try:
+        spy_df = yf.Ticker("^GSPC").history(period="1y")
+        if spy_df.empty or 'Close' not in spy_df.columns:
+            print("⚠️ 야후 파이낸스에서 지수 데이터를 가져오지 못했습니다. RS 필터를 제외하고 추세만 검증합니다.")
+            spy_close = None
+        else:
+            spy_close = spy_df['Close']
+    except Exception as e:
+        print(f"⚠️ 지수 데이터 수집 에러 ({e}), RS 필터를 일시 제외합니다.")
+        spy_close = None
+
+    print("📦 2. 전 미국 시장 종목 명단 결합 중...")
     tickers = list(set(get_sp500_tickers() + get_nasdaq100_tickers() + get_russell2000_tickers()))
+    print(f"📊 총 스캔 대상: {len(tickers)}개 종목")
     
-    stage1_count = 0       
-    stage3_vcp_details = [] 
-    
-    for i, ticker_symbol in enumerate(tickers):
-        try:
-            df = yf.Ticker(ticker_symbol).history(period="1y")
-            if check_trend_and_rs(df, spy_close):
-                stage1_count += 1
-                is_vcp, entry, stop, risk = check_vcp_and_get_prices(df)
-                if is_vcp:
-                    stage3_vcp_details.append({'ticker': ticker_symbol, 'entry': entry, 'stop': stop, 'risk': risk})
-        except: pass
-        time.sleep(0.2)
+    if not tickers:
+        print("❌ 에러: 모든 사이트에서 종목 명단을 가져오는 데 실패했습니다.")
+        send_telegram_message("❌ 스크리너 서버 에러: 종목 명단 수집 실패. 웹 서치 엔진 점검 요망.")
+    else:
+        stage1_count = 0       
+        stage3_vcp_details = [] 
         
-    today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
-    t3_text = "\n".join([f"• *{item['ticker']}* ➔ 진입가: {item['entry']}$ | 손절가: {item['stop']}$ (-{item['risk']}%)" for item in stage3_vcp_details]) if stage3_vcp_details else "조건을 만족하는 매수 임박 종목이 없습니다."
-    
-    msg = f"🔔 *[{today_str}] 미너비니 스크리닝 결과*\n------------------------------------\n📊 *대상:* S&P500+나스닥100+러셀2000 (총 {len(tickers)}개)\n📈 *1차 추세+거래량 필터 통과:* 총 {stage1_count}개\n\n🔥 *최종 VCP 통과*\n{t3_text}\n------------------------------------"
-    send_telegram_message(msg)
+        for i, ticker_symbol in enumerate(tickers):
+            try:
+                df = yf.Ticker(ticker_symbol).history(period="1y")
+                if df.empty or 'Close' not in df.columns:
+                    continue
+                if check_trend_and_rs(df, spy_close):
+                    stage1_count += 1
+                    is_vcp, entry, stop, risk = check_vcp_and_get_prices(df)
+                    if is_vcp:
+                        stage3_vcp_details.append({'ticker': ticker_symbol, 'entry': entry, 'stop': stop, 'risk': risk})
+            except: pass
+            
+            # 진행 상황 모니터링용 출력
+            if i % 200 == 0:
+                print(f"🔄 스캔 진행 중... ({i}/{len(tickers)})")
+            time.sleep(0.1)
+            
+        today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+        t3_text = "\n".join([f"• *{item['ticker']}* ➔ 진입가: {item['entry']}$ | 손절가: {item['stop']}$ (-{item['risk']}%)" for item in stage3_vcp_details]) if stage3_vcp_details else "조건을 만족하는 매수 임박 종목이 없습니다."
+        
+        msg = f"🔔 *[{today_str}] 미너비니 스크리닝 결과*\n------------------------------------\n📊 *대상:* S&P500+나스닥100+러셀2000 (총 {len(tickers)}개)\n📈 *1차 추세+거래량 필터 통과:* 총 {stage1_count}개\n\n🔥 *최종 VCP 통과*\n{t3_text}\n------------------------------------"
+        send_telegram_message(msg)
+        print("🎯 전체 스크리닝 프로세스 정상 완료!")
