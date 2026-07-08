@@ -4,6 +4,7 @@ import sys
 import time
 import io
 import csv
+import re
 import pandas as pd
 import requests
 import yfinance as yf
@@ -41,7 +42,24 @@ def send_telegram_message(message):
 def clean_ticker(ticker):
     if ticker is None:
         return ""
-    return str(ticker).strip().replace(".", "-")
+    ticker = str(ticker).strip().replace("\ufeff", "").replace('"', "")
+    ticker = ticker.replace(".", "-")
+    return ticker
+
+
+def is_valid_us_ticker(ticker):
+    ticker = clean_ticker(ticker)
+    if not ticker:
+        return False
+    if ticker.upper() in ["CASH", "USD", "-", "N/A", "VALUE"]:
+        return False
+    if " " in ticker:
+        return False
+    if ticker.startswith("RTY") or ticker.startswith("RTYM"):
+        return False
+    if len(ticker) > 8:
+        return False
+    return bool(re.match(r"^[A-Z0-9][A-Z0-9\-]*$", ticker))
 
 
 def get_html_with_header(url):
@@ -82,12 +100,11 @@ def get_nasdaq100_tickers():
 
 def decode_response_text_safely(response):
     content = response.content
-    # iShares CSV가 UTF-16 또는 NULL byte 포함 형태로 내려오는 경우 대응
     if content.startswith(b"\xff\xfe") or content.startswith(b"\xfe\xff") or content.count(b"\x00") > max(10, len(content) // 20):
         for enc in ["utf-16", "utf-16-le", "utf-16-be"]:
             try:
                 text = content.decode(enc, errors="ignore")
-                if "Ticker" in text and "Name" in text:
+                if "Ticker" in text or "Symbol" in text:
                     return text.replace("\x00", "")
             except Exception:
                 pass
@@ -101,40 +118,92 @@ def decode_response_text_safely(response):
     return response.text.replace("\x00", "")
 
 
-def extract_tickers_from_ishares_csv_text(text):
-    text = text.replace("\x00", "")
-    lines = [line for line in text.splitlines() if line.strip()]
-    start_idx = None
-    for i, line in enumerate(lines):
-        normalized = line.replace('"', '')
-        if "Ticker" in normalized and "Name" in normalized:
-            start_idx = i
-            break
-    if start_idx is None:
+def extract_tickers_from_csv_like_text(text):
+    """CSV/TSV/공백형 텍스트에서 Ticker 또는 Symbol 컬럼을 최대한 안전하게 추출."""
+    text = text.replace("\x00", "").replace("\ufeff", "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
         return []
-    reader = csv.DictReader(io.StringIO("\n".join(lines[start_idx:])))
-    tickers = []
-    for row in reader:
-        ticker = row.get("Ticker", "")
-        if ticker is None:
-            continue
-        ticker = clean_ticker(ticker)
-        if not ticker or ticker in ["-", "Cash", "CASH", "USD"]:
-            continue
-        if " " in ticker or ticker.startswith("RTY") or ticker.startswith("RTYM"):
-            continue
-        if ticker.startswith("The") or "BlackRock" in ticker:
+
+    # 1) iShares CSV처럼 Ticker/Name 헤더가 있는 경우
+    start_idx = None
+    delimiter = ","
+    for i, line in enumerate(lines):
+        norm = line.replace('"', '').lower()
+        if ("ticker" in norm or "symbol" in norm) and ("name" in norm or "sector" in norm or "asset class" in norm):
+            start_idx = i
+            delimiter = "\t" if line.count("\t") > line.count(",") else ","
             break
-        if 1 <= len(ticker) <= 8 and ticker.isascii():
-            tickers.append(ticker)
+
+    if start_idx is not None:
+        data_text = "\n".join(lines[start_idx:])
+        reader = csv.reader(io.StringIO(data_text), delimiter=delimiter)
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = []
+        normalized_header = [clean_ticker(h).lower().replace(" ", "_") for h in header]
+        ticker_col = None
+        for idx, h in enumerate(normalized_header):
+            if h in ["ticker", "symbol", "constituents"] or "ticker" in h or "symbol" in h:
+                ticker_col = idx
+                break
+        if ticker_col is None:
+            ticker_col = 0
+        tickers = []
+        for row in reader:
+            if not row or len(row) <= ticker_col:
+                continue
+            first_col = clean_ticker(row[0])
+            if first_col.startswith("The") or "BlackRock" in first_col or first_col.startswith("©"):
+                break
+            ticker = clean_ticker(row[ticker_col])
+            if is_valid_us_ticker(ticker):
+                tickers.append(ticker)
+        return sorted(set(tickers))
+
+    # 2) GitHub CSV처럼 컬럼명이 단순한 경우 pandas로 재시도
+    try:
+        df = pd.read_csv(io.StringIO(text))
+        candidates = []
+        for col in df.columns:
+            c = str(col).lower()
+            if "ticker" in c or "symbol" in c or "constituents" in c:
+                candidates.append(col)
+        if not candidates and len(df.columns) > 0:
+            candidates = [df.columns[0]]
+        tickers = []
+        for col in candidates[:1]:
+            for x in df[col].dropna().astype(str).tolist():
+                t = clean_ticker(x)
+                if is_valid_us_ticker(t) and t != "^RUT":
+                    tickers.append(t)
+        if tickers:
+            return sorted(set(tickers))
+    except Exception:
+        pass
+
+    # 3) 최후: 각 줄 첫 토큰에서 티커처럼 생긴 것만 추출
+    tickers = []
+    for line in lines:
+        token = clean_ticker(re.split(r"[,\t ]+", line)[0])
+        if is_valid_us_ticker(token) and token.upper() not in ["TICKER", "SYMBOL", "NO"]:
+            tickers.append(token)
     return sorted(set(tickers))
 
 
 def get_russell2000_tickers():
-    urls = [
-        "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
-        "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM",
-        "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv",
+    """
+    1순위: iShares IWM 공식 보유종목 CSV
+    2순위: 공개 GitHub Russell2000 CSV fallback
+    iShares가 GitHub Actions에서 인코딩/헤더 구조 문제로 0개가 나오는 경우까지 대응.
+    """
+    sources = [
+        ("iShares IWM", "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"),
+        ("iShares IWM alt1", "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM"),
+        ("iShares IWM alt2", "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv"),
+        ("GitHub quanthero fallback", "https://raw.githubusercontent.com/quanthero/US_Indices_Constituents/main/Russell2000.csv"),
+        ("GitHub ikoniaris fallback", "https://raw.githubusercontent.com/ikoniaris/Russell2000/master/russell_2000_components.csv"),
     ]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
@@ -142,19 +211,19 @@ def get_russell2000_tickers():
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf",
     }
-    for url in urls:
+    for name, url in sources:
         try:
-            print("📥 Russell2000/IWM 보유종목 수집 시도 중...")
+            print(f"📥 Russell2000 수집 시도: {name}")
             res = requests.get(url, headers=headers, timeout=40)
             res.raise_for_status()
             text = decode_response_text_safely(res)
-            tickers = extract_tickers_from_ishares_csv_text(text)
+            tickers = extract_tickers_from_csv_like_text(text)
             if len(tickers) >= 1500:
-                print(f"✅ Russell2000/IWM 티커 수집 성공: {len(tickers)}개")
+                print(f"✅ Russell2000 수집 성공({name}): {len(tickers)}개")
                 return tickers
-            print(f"⚠️ IWM CSV 파싱 결과가 적습니다: {len(tickers)}개, 다음 주소 시도")
+            print(f"⚠️ {name} 파싱 결과가 적습니다: {len(tickers)}개, 다음 소스 시도")
         except Exception as e:
-            print(f"⚠️ IWM Russell2000 수집 실패: {e}")
+            print(f"⚠️ {name} 수집 실패: {e}")
     print("❌ Russell2000 티커 수집 최종 실패")
     return []
 
@@ -257,7 +326,7 @@ def passes_trend_template(ticker, df, rs_info):
         vals = [cp, ma50, ma150, ma200, ma200_22, ma200_44, low52, high52, avg_vol, avg_dvol]
         if any(pd.isna(x) for x in vals):
             return False
-        checks = [
+        return all([
             cp > ma150 and cp > ma200,
             ma150 > ma200,
             ma200 > ma200_22 and ma200 > ma200_44,
@@ -268,8 +337,7 @@ def passes_trend_template(ticker, df, rs_info):
             rs >= MIN_RS_RATING,
             avg_vol >= MIN_AVG_VOLUME,
             avg_dvol >= MIN_DOLLAR_VOLUME,
-        ]
-        return all(checks)
+        ])
     except Exception as e:
         print(f"⚠️ {ticker} 트렌드 템플릿 오류: {e}")
         return False
