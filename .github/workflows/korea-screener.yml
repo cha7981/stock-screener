@@ -1,0 +1,74 @@
+name: Korea K-Minervini Screener
+
+on:
+  schedule:
+    # 한국시간 평일 18:10 실행
+    # GitHub Actions cron은 UTC 기준입니다.
+    # 09:10 UTC = 18:10 KST
+    - cron: '10 9 * * 1-5'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: korea-k-minervini-screener
+  cancel-in-progress: true
+
+jobs:
+  run-korea-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Seoul
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy requests pykrx
+
+      - name: Run K-Minervini Screener
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+
+          # 필요 시 분석 대상 수를 조정하세요.
+          # 400: 빠름 / 600: 기본 추천 / 800: 더 넓게 검색
+          KOREA_MAX_UNIVERSE: "600"
+
+          # pykrx 호출 간격. 오류가 많으면 0.25~0.4로 올리세요.
+          KOREA_SLEEP_SEC: "0.15"
+
+        run: python korea_minervini.py
+
+      - name: Upload Korea result CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: korea-k-minervini-result
+          path: "korea_*.csv"
+
+      - name: Notify failure
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":\"❌ Korea K-Minervini GitHub Actions 실행 실패\"}"
