@@ -1,3 +1,4 @@
+
 import os
 import time
 import random
@@ -10,7 +11,7 @@ import requests
 from pykrx import stock
 
 # ============================================================
-# K-Minervini v2.2 Settings
+# K-Minervini v2.4 Settings
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -47,6 +48,11 @@ OVERHEAT_5D_RETURN = 30.0
 OVERHEAT_10D_RETURN = 50.0
 OVERHEAT_MA20_GAP = 25.0
 
+# V2.4 quality score thresholds
+VCP_READY_SCORE = 5
+PULLBACK_QUALITY_READY_SCORE = 6
+PULLBACK_QUALITY_WATCH_SCORE = 4
+
 KST = timezone(timedelta(hours=9))
 
 
@@ -72,7 +78,6 @@ def send_telegram_message(message: str):
             text = text[cut:].lstrip()
 
         chunks.append(text)
-
         ok = True
 
         for chunk in chunks:
@@ -81,7 +86,6 @@ def send_telegram_message(message: str):
                 json={"chat_id": CHAT_ID, "text": chunk},
                 timeout=20,
             )
-
             if res.status_code != 200:
                 ok = False
                 print(f"⚠️ 텔레그램 전송 실패: {res.status_code} {res.text}")
@@ -139,20 +143,16 @@ def date_str(dt):
 
 def get_recent_business_day(max_back=10):
     now = datetime.now(KST)
-
     for i in range(max_back):
         d = now - timedelta(days=i)
         ds = date_str(d)
-
         try:
             df = stock.get_market_ohlcv_by_ticker(ds, market="KOSPI")
             if df is not None and not df.empty:
                 return ds
         except Exception:
             pass
-
         time.sleep(0.1)
-
     raise RuntimeError("최근 거래일을 찾지 못했습니다.")
 
 
@@ -166,24 +166,19 @@ def add_days_ago(base_yyyymmdd, days):
 # ============================================================
 def get_market_snapshot(end_date, market):
     df = stock.get_market_ohlcv_by_ticker(end_date, market=market)
-
     if df is None or df.empty:
         return pd.DataFrame()
-
     df = df.copy()
     df["ticker"] = df.index.astype(str)
     df["market"] = market
     df["name"] = df["ticker"].map(lambda t: stock.get_market_ticker_name(t))
-
     return df.reset_index(drop=True)
 
 
 def build_liquid_universe(end_date):
     print("📦 KOSPI/KOSDAQ 전체 snapshot 수집")
-
     kospi = get_market_snapshot(end_date, "KOSPI")
     kosdaq = get_market_snapshot(end_date, "KOSDAQ")
-
     snap = pd.concat([kospi, kosdaq], ignore_index=True)
 
     if snap.empty:
@@ -199,18 +194,14 @@ def build_liquid_universe(end_date):
 
     snap = snap[(snap["close"] >= MIN_PRICE) & (snap["turnover"] > 0)].copy()
     snap = snap.sort_values("turnover", ascending=False).head(MAX_UNIVERSE).copy()
-
     print(f"✅ 1차 유동성 후보: {len(snap)}개 / MAX_UNIVERSE={MAX_UNIVERSE}")
-
     return snap
 
 
 def get_history(ticker, start_date, end_date):
     df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
-
     if df is None or df.empty:
         return None
-
     df = df.copy()
 
     rename = {
@@ -222,7 +213,6 @@ def get_history(ticker, start_date, end_date):
         "거래대금": "Turnover",
         "등락률": "ChangePct",
     }
-
     df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
     if not all(c in df.columns for c in ["Open", "High", "Low", "Close", "Volume"]):
@@ -232,24 +222,22 @@ def get_history(ticker, start_date, end_date):
         df["Turnover"] = df["Close"] * df["Volume"]
 
     df = df.dropna(subset=["Close"]).copy()
-
     if len(df) < 160:
         return None
 
     for c in ["Open", "High", "Low", "Close", "Volume", "Turnover"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    df["MA10"] = df["Close"].rolling(10).mean()
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA60"] = df["Close"].rolling(60).mean()
     df["MA120"] = df["Close"].rolling(120).mean()
-    df["MA10"] = df["Close"].rolling(10).mean()
     df["VolMA20"] = df["Volume"].rolling(20).mean()
     df["TurnoverMA20"] = df["Turnover"].rolling(20).mean()
 
     tr1 = df["High"] - df["Low"]
     tr2 = (df["High"] - df["Close"].shift(1)).abs()
     tr3 = (df["Low"] - df["Close"].shift(1)).abs()
-
     df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["ATR10"] = df["TR"].rolling(10).mean()
     df["ATR30"] = df["TR"].rolling(30).mean()
@@ -260,13 +248,10 @@ def get_history(ticker, start_date, end_date):
 def safe_return(close, days):
     if len(close) <= days:
         return np.nan
-
     start = close.iloc[-days]
     end = close.iloc[-1]
-
     if start <= 0 or pd.isna(start) or pd.isna(end):
         return np.nan
-
     return end / start - 1
 
 
@@ -275,26 +260,16 @@ def safe_return(close, days):
 # ============================================================
 def get_net_purchase_by_investor(start_date, end_date, investor):
     frames = []
-
     for market in ["KOSPI", "KOSDAQ"]:
         try:
-            df = stock.get_market_net_purchases_of_equities(
-                start_date,
-                end_date,
-                market,
-                investor,
-            )
-
+            df = stock.get_market_net_purchases_of_equities(start_date, end_date, market, investor)
             if df is None or df.empty:
                 continue
-
             df = df.copy()
             df["ticker"] = df.index.astype(str)
             df["market"] = market
-
             frames.append(df.reset_index(drop=True))
             time.sleep(0.2)
-
         except Exception as e:
             print(f"⚠️ {investor} {market} 순매수 조회 실패: {e}")
 
@@ -302,19 +277,13 @@ def get_net_purchase_by_investor(start_date, end_date, investor):
         return pd.DataFrame(columns=["ticker", f"{investor}_net"])
 
     merged = pd.concat(frames, ignore_index=True)
-
     net_col = safe_col(merged, ["순매수거래대금", "순매수", "순매수금액", "거래대금"])
 
     if net_col is None:
         numeric_cols = merged.select_dtypes(include=[np.number]).columns.tolist()
         net_col = numeric_cols[-1] if numeric_cols else None
 
-    merged[f"{investor}_net"] = (
-        pd.to_numeric(merged[net_col], errors="coerce").fillna(0)
-        if net_col
-        else 0
-    )
-
+    merged[f"{investor}_net"] = pd.to_numeric(merged[net_col], errors="coerce").fillna(0) if net_col else 0
     return merged[["ticker", f"{investor}_net"]]
 
 
@@ -329,12 +298,10 @@ def get_recent_supply_counts(ticker, start_date, end_date):
 
     try:
         df = stock.get_market_trading_value_by_date(start_date, end_date, ticker)
-
         if df is None or df.empty:
             return out
 
         df = df.tail(5).copy()
-
         fcol = safe_col(df, ["외국인", "외국인합계"])
         icol = safe_col(df, ["기관합계", "기관"])
 
@@ -372,32 +339,26 @@ def trend_score(df):
 
     high52 = df["Close"].tail(252).max()
     low52 = df["Close"].tail(252).min()
-
     ma120_prev = df["MA120"].iloc[-21] if len(df) >= 141 else np.nan
 
     if close > ma20:
         score += 5
         reasons.append("종가>MA20")
-
     if close > ma60:
         score += 5
         reasons.append("종가>MA60")
-
     if ma60 > ma120:
         score += 5
         reasons.append("MA60>MA120")
-
     if not pd.isna(ma120_prev) and ma120 > ma120_prev:
         score += 5
         reasons.append("MA120상승")
-
     if high52 > 0 and close >= high52 * 0.85:
         score += 5
         reasons.append("52주고점15%이내")
 
     dd_from_high = (close / high52 - 1) * 100 if high52 > 0 else np.nan
     up_from_low = (close / low52 - 1) * 100 if low52 > 0 else np.nan
-
     return score, ";".join(reasons), dd_from_high, up_from_low
 
 
@@ -443,6 +404,189 @@ def risk_grade(risk):
     return "제외"
 
 
+def detect_vcp(df):
+    """
+    VCP 간이 판정:
+    - 최근 60일을 20일씩 3구간 분리
+    - 구간 변동폭 축소, 거래량 감소, ATR 감소, 높은 저점, 피봇 근처 여부를 점수화
+    """
+    out = {
+        "vcp_score": 0,
+        "vcp_ready": False,
+        "vcp_reason": "",
+        "vcp_range_early": np.nan,
+        "vcp_range_mid": np.nan,
+        "vcp_range_final": np.nan,
+        "vcp_volume_ratio": np.nan,
+        "vcp_atr_ratio": np.nan,
+        "vcp_final_tight": False,
+        "vcp_higher_low": False,
+    }
+
+    if df is None or len(df) < 80:
+        return out
+
+    d = df.copy()
+    last = d.iloc[-1]
+    close = last["Close"]
+    w = d.tail(60).copy()
+
+    if len(w) < 60:
+        return out
+
+    early = w.iloc[0:20]
+    mid = w.iloc[20:40]
+    final = w.iloc[40:60]
+
+    def range_pct(x):
+        hi = x["High"].max()
+        lo = x["Low"].min()
+        if hi <= 0 or pd.isna(hi) or pd.isna(lo):
+            return np.nan
+        return (hi - lo) / hi * 100
+
+    r1 = range_pct(early)
+    r2 = range_pct(mid)
+    r3 = range_pct(final)
+    out["vcp_range_early"] = r1
+    out["vcp_range_mid"] = r2
+    out["vcp_range_final"] = r3
+
+    score = 0
+    reasons = []
+
+    if not pd.isna(r1) and not pd.isna(r2) and not pd.isna(r3):
+        if r1 > r2 > r3:
+            score += 2
+            reasons.append("수축연속")
+        elif r2 > r3 and r3 <= 10:
+            score += 1
+            reasons.append("최종수축")
+
+    if not pd.isna(r3) and r3 <= 8:
+        score += 1
+        reasons.append("최종8%이내")
+        out["vcp_final_tight"] = True
+    elif not pd.isna(r3) and r3 <= 10:
+        score += 0.5
+        reasons.append("최종10%이내")
+        out["vcp_final_tight"] = True
+
+    prev_low = w.iloc[0:40]["Low"].min()
+    final_low = final["Low"].min()
+    if final_low > prev_low:
+        score += 1
+        reasons.append("고점부높은저점")
+        out["vcp_higher_low"] = True
+
+    vol5 = d["Volume"].tail(5).mean()
+    vol20 = d["Volume"].tail(20).mean()
+    vol_ratio = vol5 / vol20 if vol20 and vol20 > 0 else np.nan
+    out["vcp_volume_ratio"] = vol_ratio
+    if not pd.isna(vol_ratio) and vol_ratio <= 0.80:
+        score += 1
+        reasons.append("거래량DryUp")
+
+    atr10 = last.get("ATR10", np.nan)
+    atr30 = last.get("ATR30", np.nan)
+    atr_ratio = atr10 / atr30 if not pd.isna(atr10) and not pd.isna(atr30) and atr30 > 0 else np.nan
+    out["vcp_atr_ratio"] = atr_ratio
+    if not pd.isna(atr_ratio) and atr_ratio <= 0.90:
+        score += 1
+        reasons.append("ATR수축")
+
+    pivot = d["High"].tail(PIVOT_LOOKBACK).max()
+    dist_to_pivot = (close / pivot - 1) * 100 if pivot > 0 else np.nan
+    if not pd.isna(dist_to_pivot) and -BREAKOUT_NEAR_PCT <= dist_to_pivot <= 1.5:
+        score += 1
+        reasons.append("피봇근처")
+
+    ret10 = safe_return(d["Close"].dropna(), 10) * 100
+    ma20 = last.get("MA20", np.nan)
+    ma20_gap = (close / ma20 - 1) * 100 if ma20 and ma20 > 0 else np.nan
+    if (not pd.isna(ret10) and ret10 >= 20) or (not pd.isna(ma20_gap) and ma20_gap >= 18):
+        score -= 1
+        reasons.append("급등후감점")
+
+    score = max(0, min(7, score))
+    out["vcp_score"] = round(score, 1)
+    out["vcp_ready"] = bool(score >= VCP_READY_SCORE)
+    out["vcp_reason"] = ";".join(reasons)
+    return out
+
+
+def detect_pullback_quality(df, drawdown, near_ma20, near_ma60, volume_dryup, atr_dryup, risk):
+    """
+    Pullback Quality Score 0~9점.
+    눌림목은 완전한 VCP보다 '건강한 조정'을 보는 별도 점수로 판정합니다.
+    """
+    out = {
+        "pullback_quality_score": 0,
+        "pullback_quality_ready": False,
+        "pullback_quality_reason": "",
+        "pullback_higher_low": False,
+        "pullback_above_ma60": False,
+        "pullback_above_ma20": False,
+        "pullback_volume_dryup": bool(volume_dryup),
+        "pullback_atr_dryup": bool(atr_dryup),
+    }
+
+    if df is None or len(df) < 50:
+        return out
+
+    last = df.iloc[-1]
+    close = last["Close"]
+    ma20 = last.get("MA20", np.nan)
+    ma60 = last.get("MA60", np.nan)
+
+    score = 0
+    reasons = []
+
+    if not pd.isna(drawdown) and PULLBACK_MIN_DD <= drawdown <= PULLBACK_MAX_DD:
+        score += 2
+        reasons.append("적정조정")
+
+    if near_ma20 or near_ma60:
+        score += 2
+        reasons.append("이평선근처")
+
+    if volume_dryup:
+        score += 1
+        reasons.append("거래량감소")
+
+    if atr_dryup:
+        score += 1
+        reasons.append("ATR감소")
+
+    # 최근 저점이 이전 저점보다 높은지: 최근 10일 저점 > 이전 20일 저점
+    recent_low_10 = df["Low"].tail(10).min()
+    prev_low_20 = df["Low"].iloc[-30:-10].min() if len(df) >= 30 else np.nan
+    if not pd.isna(recent_low_10) and not pd.isna(prev_low_20) and recent_low_10 > prev_low_20:
+        score += 1
+        reasons.append("높은저점")
+        out["pullback_higher_low"] = True
+
+    if not pd.isna(ma60) and close > ma60:
+        score += 1
+        reasons.append("60일선위")
+        out["pullback_above_ma60"] = True
+
+    if not pd.isna(ma20) and close >= ma20 * 0.97:
+        score += 0.5
+        reasons.append("20일선방어")
+        out["pullback_above_ma20"] = True
+
+    if not pd.isna(risk) and risk <= MAX_RISK_PCT:
+        score += 0.5
+        reasons.append("리스크양호")
+
+    score = max(0, min(9, score))
+    out["pullback_quality_score"] = round(score, 1)
+    out["pullback_quality_ready"] = bool(score >= PULLBACK_QUALITY_READY_SCORE)
+    out["pullback_quality_reason"] = ";".join(reasons)
+    return out
+
+
 def setup_scores(df):
     last = df.iloc[-1]
 
@@ -460,7 +604,6 @@ def setup_scores(df):
 
     vol_recent = df["Volume"].tail(5).mean()
     vol_ma20 = last["VolMA20"]
-
     turnover_today = df["Turnover"].tail(1).mean()
     turnover_ma20 = last["TurnoverMA20"]
 
@@ -473,28 +616,45 @@ def setup_scores(df):
 
     atr10 = last.get("ATR10", np.nan)
     atr30 = last.get("ATR30", np.nan)
-    atr_dryup = (
-        not pd.isna(atr10)
-        and not pd.isna(atr30)
-        and atr30 > 0
-        and atr10 <= atr30 * 0.9
-    )
+    atr_dryup = not pd.isna(atr10) and not pd.isna(atr30) and atr30 > 0 and atr10 <= atr30 * 0.9
 
     near_ma20 = not pd.isna(ma20) and abs(close / ma20 - 1) * 100 <= NEAR_MA20_PCT
     near_ma60 = not pd.isna(ma60) and abs(close / ma60 - 1) * 100 <= NEAR_MA60_PCT
 
-    pullback = (
+    pullback_basic = (
         PULLBACK_MIN_DD <= drawdown <= PULLBACK_MAX_DD
         and (near_ma20 or near_ma60)
         and volume_dryup
     )
 
-    breakout_near = (
-        abs(dist_to_pivot) <= BREAKOUT_NEAR_PCT
-        or (-BREAKOUT_NEAR_PCT <= dist_to_pivot <= 1.5)
+    breakout_near = abs(dist_to_pivot) <= BREAKOUT_NEAR_PCT or (-BREAKOUT_NEAR_PCT <= dist_to_pivot <= 1.5)
+
+    vcp = detect_vcp(df)
+    vcp_ready = vcp["vcp_ready"]
+
+    breakout_today = close >= pivot and volume_explosion and turnover_explosion and vcp["vcp_score"] >= 3
+
+    recent_low = df["Low"].tail(20).min()
+
+    # preliminary risk for pullback quality
+    prelim_entry = close if pullback_basic else pivot
+    prelim_stop = max(recent_low, close * 0.95) if pullback_basic else max(recent_low, pivot * 0.94)
+    if prelim_stop <= 0 or prelim_stop >= prelim_entry:
+        prelim_stop = prelim_entry * 0.95
+    prelim_risk = (prelim_entry - prelim_stop) / prelim_entry * 100 if prelim_entry > 0 else np.nan
+
+    pullback_quality = detect_pullback_quality(
+        df=df,
+        drawdown=drawdown,
+        near_ma20=near_ma20,
+        near_ma60=near_ma60,
+        volume_dryup=volume_dryup,
+        atr_dryup=atr_dryup,
+        risk=prelim_risk,
     )
 
-    breakout_today = close >= pivot and volume_explosion and turnover_explosion
+    # V2.4 핵심: Pullback Ready는 기본 눌림목 + 품질점수 6점 이상
+    pullback = bool(pullback_basic and pullback_quality["pullback_quality_score"] >= PULLBACK_QUALITY_READY_SCORE)
 
     score = 0
     reasons = []
@@ -502,13 +662,26 @@ def setup_scores(df):
     if breakout_today:
         score += 8
         reasons.append("오늘돌파")
+    elif breakout_near and vcp_ready:
+        score += 6
+        reasons.append("VCP피봇근처")
     elif breakout_near:
-        score += 5
-        reasons.append("피봇근처")
+        score += 2
+        reasons.append("피봇근처_수축부족")
+
+    if vcp_ready:
+        score += 4
+        reasons.append("VCP수축")
+    elif vcp["vcp_score"] >= 3:
+        score += 2
+        reasons.append("VCP부분충족")
 
     if pullback:
-        score += 5
-        reasons.append("눌림목")
+        score += 6
+        reasons.append("고품질눌림목")
+    elif pullback_basic:
+        score += 3
+        reasons.append("눌림목_품질부족")
 
     if volume_dryup:
         score += 3
@@ -526,11 +699,6 @@ def setup_scores(df):
         score += 2
         reasons.append("거래대금증가")
 
-    recent_low = df["Low"].tail(20).min()
-
-    # ========================================================
-    # V2.1 Minervini-style Risk Calculation
-    # ========================================================
     if pullback:
         entry = close
         stop = max(recent_low, close * 0.95)
@@ -542,16 +710,12 @@ def setup_scores(df):
 
     if stop <= 0:
         stop = entry * 0.95
-
     if stop >= entry:
         stop = entry * 0.95
 
     risk_amount = entry - stop
     risk = (risk_amount / entry) * 100 if entry > 0 else np.nan
 
-    # ========================================================
-    # V2.2 Profit Targets / Exit Plan
-    # ========================================================
     target_1r = entry + risk_amount
     target_2r = entry + risk_amount * 2
     target_3r = entry + risk_amount * 3
@@ -575,21 +739,18 @@ def setup_scores(df):
     if not pd.isna(ret5) and ret5 >= OVERHEAT_5D_RETURN:
         overheat = True
         overheat_reasons.append("5일급등")
-
     if not pd.isna(ret10) and ret10 >= OVERHEAT_10D_RETURN:
         overheat = True
         overheat_reasons.append("10일급등")
-
     if not pd.isna(ma20_gap) and ma20_gap >= OVERHEAT_MA20_GAP:
         overheat = True
         overheat_reasons.append("MA20과열")
-
     if risk > AVOID_RISK_PCT:
         overheat = True
         overheat_reasons.append("리스크과대")
 
     return {
-        "setup_score": min(score, 20),
+        "setup_score": min(score, 26),
         "setup_reason": ";".join(reasons),
         "trade_type": trade_type,
         "entry": entry,
@@ -597,8 +758,9 @@ def setup_scores(df):
         "recent_high": recent_high,
         "drawdown_pct": drawdown,
         "dist_to_pivot_pct": dist_to_pivot,
-        "pullback_ready": bool(pullback),
-        "breakout_ready": bool(breakout_near and risk <= MAX_RISK_PCT),
+        "pullback_basic": bool(pullback_basic),
+        "pullback_ready": bool(pullback and risk <= MAX_RISK_PCT),
+        "breakout_ready": bool(breakout_near and vcp_ready and risk <= MAX_RISK_PCT),
         "breakout_today": bool(breakout_today and risk <= MAX_RISK_PCT),
         "volume_dryup": bool(volume_dryup),
         "atr_dryup": bool(atr_dryup),
@@ -623,6 +785,8 @@ def setup_scores(df):
         "ma20_gap_pct": ma20_gap,
         "overheat": bool(overheat),
         "overheat_reason": ";".join(overheat_reasons),
+        **vcp,
+        **pullback_quality,
     }
 
 
@@ -636,7 +800,7 @@ def analyze():
     supply5_start = add_days_ago(end_date, 10)
     today_label = datetime.now(KST).strftime("%Y-%m-%d")
 
-    print(f"🇰🇷 K-Minervini v2.2 실행일: {today_label}, 기준거래일: {end_date}")
+    print(f"🇰🇷 K-Minervini v2.4 실행일: {today_label}, 기준거래일: {end_date}")
 
     universe = build_liquid_universe(end_date)
     tickers = universe["ticker"].tolist()
@@ -644,11 +808,9 @@ def analyze():
     print("💰 외국인/기관 20일 순매수 수집")
     foreign = get_net_purchase_by_investor(supply_start, end_date, "외국인")
     inst = get_net_purchase_by_investor(supply_start, end_date, "기관합계")
-
     supply = pd.merge(foreign, inst, on="ticker", how="outer")
 
     rows = []
-
     print(f"📈 가격 데이터 및 점수 계산 시작: {len(tickers)}개")
 
     for idx, ticker in enumerate(tickers, start=1):
@@ -657,7 +819,6 @@ def analyze():
 
         try:
             df = get_history(ticker, start_date, end_date)
-
             if df is None:
                 continue
 
@@ -669,11 +830,9 @@ def analyze():
                 continue
 
             close_series = df["Close"].dropna()
-
             r3 = safe_return(close_series, 63)
             r6 = safe_return(close_series, 126)
             r12 = safe_return(close_series, 252)
-
             weighted_return = r3 * 0.4 + r6 * 0.3 + r12 * 0.3
 
             ts, trend_reasons, dd52, up_low = trend_score(df)
@@ -721,18 +880,10 @@ def analyze():
 
     result["rs_percentile"] = result["weighted_return"].rank(pct=True) * 100
     result["rs_score"] = (result["rs_percentile"] / 100 * 20).round(1)
-
     result["supply_base"] = result["avg_turnover_20d"] * 20
 
-    result["foreign_score"] = result.apply(
-        lambda r: supply_score(r["외국인_net"], r["supply_base"]),
-        axis=1,
-    )
-
-    result["institution_score"] = result.apply(
-        lambda r: institution_score(r["기관합계_net"], r["supply_base"]),
-        axis=1,
-    )
+    result["foreign_score"] = result.apply(lambda r: supply_score(r["외국인_net"], r["supply_base"]), axis=1)
+    result["institution_score"] = result.apply(lambda r: institution_score(r["기관합계_net"], r["supply_base"]), axis=1)
 
     result["total_score"] = (
         result["trend_score"]
@@ -743,14 +894,10 @@ def analyze():
         + result["setup_score"]
     ).round(1)
 
-    result = result.sort_values(
-        ["total_score", "rs_percentile", "avg_turnover_20d"],
-        ascending=False,
-    ).copy()
+    result = result.sort_values(["total_score", "rs_percentile", "avg_turnover_20d"], ascending=False).copy()
 
     detail_target = result.head(SUPPLY_DETAIL_LIMIT).copy()
     detail_rows = []
-
     print(f"🔎 최근 5일 수급 연속성 조회: 상위 {len(detail_target)}개")
 
     for _, row in detail_target.iterrows():
@@ -764,67 +911,31 @@ def analyze():
         detail_df = pd.DataFrame(detail_rows)
         result = result.merge(detail_df, on="ticker", how="left")
 
-    for col in [
-        "foreign_buy_days_5d",
-        "institution_buy_days_5d",
-        "co_buy_days_5d",
-        "foreign_net_5d",
-        "institution_net_5d",
-    ]:
+    for col in ["foreign_buy_days_5d", "institution_buy_days_5d", "co_buy_days_5d", "foreign_net_5d", "institution_net_5d"]:
         if col not in result.columns:
             result[col] = 0
         result[col] = result[col].fillna(0)
 
     result["supply_momentum_score"] = 0
-
     result.loc[result["foreign_buy_days_5d"] >= 3, "supply_momentum_score"] += 2
     result.loc[result["institution_buy_days_5d"] >= 3, "supply_momentum_score"] += 2
     result.loc[result["co_buy_days_5d"] >= 2, "supply_momentum_score"] += 1
-
     result["total_score"] = (result["total_score"] + result["supply_momentum_score"]).round(1)
 
     # ========================================================
-    # V2.2 Classification
+    # V2.4 Classification
     # ========================================================
     result["category"] = "WATCH"
 
-    result.loc[
-        (result["total_score"] >= PULLBACK_SCORE)
-        & (result["pullback_ready"]),
-        "category",
-    ] = "PULLBACK_READY"
+    result.loc[(result["total_score"] >= PULLBACK_SCORE) & (result["pullback_ready"]), "category"] = "PULLBACK_READY"
+    result.loc[(result["total_score"] >= BREAKOUT_SCORE) & (result["breakout_ready"]), "category"] = "BREAKOUT_READY"
+    result.loc[(result["total_score"] >= BREAKOUT_TODAY_SCORE) & (result["breakout_today"]), "category"] = "BREAKOUT_TODAY"
 
-    result.loc[
-        (result["total_score"] >= BREAKOUT_SCORE)
-        & (result["breakout_ready"]),
-        "category",
-    ] = "BREAKOUT_READY"
-
-    result.loc[
-        (result["total_score"] >= BREAKOUT_TODAY_SCORE)
-        & (result["breakout_today"]),
-        "category",
-    ] = "BREAKOUT_TODAY"
-
-    result.loc[
-        (result["total_score"] >= AVOID_MIN_SCORE)
-        & (result["risk_pct"] > AVOID_RISK_PCT),
-        "category",
-    ] = "AVOID"
-
-    result.loc[
-        (result["total_score"] >= AVOID_MIN_SCORE)
-        & (result["overheat"])
-        & (result["category"] == "WATCH"),
-        "category",
-    ] = "AVOID"
+    result.loc[(result["total_score"] >= AVOID_MIN_SCORE) & (result["risk_pct"] > AVOID_RISK_PCT), "category"] = "AVOID"
+    result.loc[(result["total_score"] >= AVOID_MIN_SCORE) & (result["overheat"]) & (result["category"] == "WATCH"), "category"] = "AVOID"
 
     result = result[result["total_score"] >= WATCH_SCORE].copy()
-
-    result = result.sort_values(
-        ["category", "total_score", "rs_percentile"],
-        ascending=[True, False, False],
-    )
+    result = result.sort_values(["category", "total_score", "rs_percentile"], ascending=[True, False, False])
 
     result.to_csv(f"korea_all_candidates_{today_label}.csv", index=False, encoding="utf-8-sig")
     result[result["category"] == "BREAKOUT_TODAY"].to_csv(f"korea_breakout_today_{today_label}.csv", index=False, encoding="utf-8-sig")
@@ -855,20 +966,21 @@ def format_section(df, title, limit=8):
 
         volume_ratio = r.get("volume_ratio", np.nan)
         turnover_ratio = r.get("turnover_ratio", np.nan)
-
         volume_ratio_text = "-" if pd.isna(volume_ratio) else f"{volume_ratio:.2f}"
         turnover_ratio_text = "-" if pd.isna(turnover_ratio) else f"{turnover_ratio:.2f}"
 
         lines.append(
             f"• {r['name']}({r['ticker']}) [{r['market']}] 점수 {r['total_score']:.1f}\n"
             f"  현재가 {fmt_int(r['close'])}원 | 진입 {fmt_int(r['entry'])}원 | 피봇 {fmt_int(r['pivot'])}원 | 손절 {fmt_int(r['stop'])}원\n"
-            f"  리스크 {r['risk_pct']:.1f}%({r['risk_grade']}) | RS {r['rs_percentile']:.0f}\n"
+            f"  리스크 {r['risk_pct']:.1f}%({r['risk_grade']}) | RS {r['rs_percentile']:.0f} | VCP {r.get('vcp_score', 0):.1f}/7 | PB품질 {r.get('pullback_quality_score', 0):.1f}/9\n"
             f"  1R {fmt_int(r['target_1r'])}원 | 2R {fmt_int(r['target_2r'])}원 | 3R {fmt_int(r['target_3r'])}원\n"
             f"  매도전략: 1R 도달 시 본전스탑, 2R 부근 일부익절, 잔여 추세추종\n"
             f"  52주고점대비 {fmt_pct(r['drawdown_52w_pct'])} | 최근고점대비 {fmt_pct(r['drawdown_pct'])}\n"
             f"  외국인20일 {foreign_mark} {fmt_krw_eok(r.get('외국인_net', 0))} | 기관20일 {inst_mark} {fmt_krw_eok(r.get('기관합계_net', 0))}\n"
             f"  최근5일: 외국인 {int(r.get('foreign_buy_days_5d', 0))}/5일, 기관 {int(r.get('institution_buy_days_5d', 0))}/5일, 동시 {int(r.get('co_buy_days_5d', 0))}/5일\n"
             f"  거래대금 {fmt_krw_eok(r['avg_turnover_20d'])} | 거래량비율 {volume_ratio_text} | 거래대금비율 {turnover_ratio_text}\n"
+            f"  VCP: {r.get('vcp_reason', '')} | 최종수축 {fmt_pct(r.get('vcp_range_final', np.nan))}\n"
+            f"  PB: {r.get('pullback_quality_reason', '')}\n"
             f"  메모: {r.get('setup_reason', '')}{special}"
         )
 
@@ -886,7 +998,7 @@ def build_message(result, today_label, end_date, universe_count):
     avoid = result[result["category"] == "AVOID"]
 
     msg = (
-        f"🇰🇷 K-Minervini v2.2 결과\n"
+        f"🇰🇷 K-Minervini v2.4 결과\n"
         f"기준일: {today_label} / KRX 거래일: {end_date}\n"
         f"------------------------------------\n"
         f"분석대상: 유동성 상위 {universe_count}개\n"
@@ -903,10 +1015,9 @@ def build_message(result, today_label, end_date, universe_count):
         f"{format_section(avoid, '⚠️ Avoid / 과열주의', 4)}\n\n"
         f"------------------------------------\n"
         f"※ 투자 추천이 아닌 자동 선별 결과입니다.\n"
-        f"※ v2.2는 1R/2R/3R 목표가와 익절전략을 추가했습니다.\n"
+        f"※ v2.4는 Breakout에 VCP 필터, Pullback에 눌림목 품질점수를 추가했습니다.\n"
         f"※ 실제 매매 전 차트, 수급, 공시, 실적을 반드시 확인하세요."
     )
-
     return msg
 
 
@@ -915,15 +1026,10 @@ def main():
         result, today_label, end_date, universe_count = analyze()
         msg = build_message(result, today_label, end_date, universe_count)
         send_telegram_message(msg)
-        print("🎯 K-Minervini v2.2 완료")
-
+        print("🎯 K-Minervini v2.4 완료")
     except Exception as e:
         print(traceback.format_exc())
-        send_telegram_message(
-            f"❌ K-Minervini v2.2 실행 실패\n"
-            f"{e}\n\n"
-            f"로그를 GitHub Actions에서 확인하세요."
-        )
+        send_telegram_message(f"❌ K-Minervini v2.4 실행 실패\n{e}\n\n로그를 GitHub Actions에서 확인하세요.")
         raise
 
 
