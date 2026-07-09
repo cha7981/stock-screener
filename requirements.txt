@@ -1,6 +1,8 @@
 yfinance
 pandas
+numpy
 requests
 lxml
-finance-datareader
-numpy
+beautifulsoup4
+html5lib
+pykrx
