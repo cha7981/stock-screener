@@ -17,7 +17,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 # GitHub Actions runtime control
-MAX_UNIVERSE = int(os.environ.get("KOREA_MAX_UNIVERSE", "600"))  # 유동성 상위 분석 종목 수
+MAX_UNIVERSE = int(os.environ.get("KOREA_MAX_UNIVERSE", "600"))
 SLEEP_SEC = float(os.environ.get("KOREA_SLEEP_SEC", "0.15"))
 
 # Liquidity / price filters
@@ -56,7 +56,6 @@ def send_telegram_message(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     try:
-        # Telegram sendMessage 길이 제한 대응
         chunks = []
         text = message
 
@@ -92,6 +91,9 @@ def send_telegram_message(message: str):
         return False
 
 
+# ============================================================
+# Format helpers
+# ============================================================
 def fmt_int(x):
     try:
         if pd.isna(x):
@@ -106,6 +108,22 @@ def fmt_pct(x):
         if pd.isna(x):
             return "-"
         return f"{float(x):.1f}%"
+    except Exception:
+        return "-"
+
+
+def fmt_krw_eok(x):
+    """
+    원 단위 금액을 억원 단위로 변환해서 표시합니다.
+    예:
+    12,345,000,000원 -> 123.5억
+    -3,456,000,000원 -> -34.6억
+    """
+    try:
+        if pd.isna(x):
+            return "-"
+        value = float(x) / 100_000_000
+        return f"{value:,.1f}억"
     except Exception:
         return "-"
 
@@ -698,8 +716,8 @@ def format_section(df, title, limit=10):
             f"• {r['name']}({r['ticker']}) [{r['market']}] 점수 {r['total_score']:.1f}\n"
             f"  현재가 {fmt_int(r['close'])}원 | 피봇 {fmt_int(r['pivot'])}원 | 손절 {fmt_int(r['stop'])}원 | 리스크 {r['risk_pct']:.1f}%\n"
             f"  RS {r['rs_percentile']:.0f} | 52주고점대비 {fmt_pct(r['drawdown_52w_pct'])} | 최근고점대비 {fmt_pct(r['drawdown_pct'])}\n"
-            f"  외국인 {foreign_mark} {fmt_int(r.get('외국인_net', 0))}원 | 기관 {inst_mark} {fmt_int(r.get('기관합계_net', 0))}원\n"
-            f"  20일평균거래대금 {fmt_int(r['avg_turnover_20d'])}원 | {r.get('setup_reason', '')}"
+            f"  외국인 {foreign_mark} {fmt_krw_eok(r.get('외국인_net', 0))} | 기관 {inst_mark} {fmt_krw_eok(r.get('기관합계_net', 0))}\n"
+            f"  20일평균거래대금 {fmt_krw_eok(r['avg_turnover_20d'])} | {r.get('setup_reason', '')}"
         )
 
     if len(df) > limit:
