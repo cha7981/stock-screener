@@ -46,6 +46,8 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
 
           # 필요 시 분석 대상 수를 조정하세요.
           # 400: 빠름 / 600: 기본 추천 / 800: 더 넓게 검색
