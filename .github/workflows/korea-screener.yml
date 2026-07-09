@@ -5,7 +5,7 @@ on:
     # 한국시간 평일 18:10 실행
     # GitHub Actions cron은 UTC 기준입니다.
     # 09:10 UTC = 18:10 KST
-    - cron: '10 9 * * 1-5'
+    - cron: '7 9 * * 1-5'
 
   workflow_dispatch:
 
