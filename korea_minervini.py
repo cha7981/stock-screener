@@ -11,7 +11,7 @@ from pykrx import stock
 
 
 # ============================================================
-# K-Minervini v2 Settings
+# K-Minervini v2.1 Settings
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -43,7 +43,6 @@ AVOID_RISK_PCT = 10.0
 
 VOLUME_EXPLOSION_RATIO = 1.5
 TURNOVER_EXPLOSION_RATIO = 1.5
-STRONG_EXPLOSION_RATIO = 2.0
 
 OVERHEAT_5D_RETURN = 30.0
 OVERHEAT_10D_RETURN = 50.0
@@ -326,10 +325,6 @@ def get_net_purchase_by_investor(start_date, end_date, investor):
 
 
 def get_recent_supply_counts(ticker, start_date, end_date):
-    """
-    최근 5일 투자자별 순매수 일수.
-    실패 시 0으로 반환합니다.
-    """
     out = {
         "foreign_buy_days_5d": 0,
         "institution_buy_days_5d": 0,
@@ -564,15 +559,33 @@ def setup_scores(df):
 
     recent_low = df["Low"].tail(20).min()
 
+    # ========================================================
+    # V2.1 Minervini-style Risk Calculation
+    # ========================================================
+    # Breakout:
+    #   entry = pivot
+    #   stop  = max(recent_low, entry * 0.94)
+    #
+    # Pullback:
+    #   entry = close
+    #   stop  = max(recent_low, close * 0.95)
+    #
+    # risk = (entry - stop) / entry * 100
+    # ========================================================
     if pullback:
-        stop = min(recent_low, close * 0.97)
+        entry = close
+        stop = max(recent_low, close * 0.95)
     else:
-        stop = max(recent_low, close * 0.94)
+        entry = pivot
+        stop = max(recent_low, entry * 0.94)
 
-    if stop <= 0 or stop >= close:
-        stop = close * 0.94
+    if stop <= 0:
+        stop = entry * 0.95
 
-    risk = (close / stop - 1) * 100
+    if stop >= entry:
+        stop = entry * 0.95
+
+    risk = ((entry - stop) / entry) * 100
 
     ret5 = safe_return(df["Close"].dropna(), 5) * 100
     ret10 = safe_return(df["Close"].dropna(), 10) * 100
@@ -600,6 +613,7 @@ def setup_scores(df):
     return {
         "setup_score": min(score, 20),
         "setup_reason": ";".join(reasons),
+        "entry": entry,
         "pivot": pivot,
         "recent_high": recent_high,
         "drawdown_pct": drawdown,
@@ -632,7 +646,7 @@ def analyze():
     supply5_start = add_days_ago(end_date, 10)
     today_label = datetime.now(KST).strftime("%Y-%m-%d")
 
-    print(f"🇰🇷 K-Minervini v2 실행일: {today_label}, 기준거래일: {end_date}")
+    print(f"🇰🇷 K-Minervini v2.1 실행일: {today_label}, 기준거래일: {end_date}")
 
     universe = build_liquid_universe(end_date)
     tickers = universe["ticker"].tolist()
@@ -783,7 +797,9 @@ def analyze():
         result["total_score"] + result["supply_momentum_score"]
     ).round(1)
 
-    # Classify with Avoid
+    # ========================================================
+    # V2.1 Classification
+    # ========================================================
     result["category"] = "WATCH"
 
     result.loc[
@@ -804,9 +820,19 @@ def analyze():
         "category",
     ] = "BREAKOUT_TODAY"
 
+    # 리스크 10% 초과는 진짜 Avoid
     result.loc[
         (result["total_score"] >= AVOID_MIN_SCORE)
-        & (result["overheat"]),
+        & (result["risk_pct"] > AVOID_RISK_PCT),
+        "category",
+    ] = "AVOID"
+
+    # 단순 과열은 WATCH 종목에만 Avoid 적용
+    # Breakout / Pullback 후보는 유지하고 텔레그램에 경고만 표시
+    result.loc[
+        (result["total_score"] >= AVOID_MIN_SCORE)
+        & (result["overheat"])
+        & (result["category"] == "WATCH"),
         "category",
     ] = "AVOID"
 
@@ -881,8 +907,9 @@ def format_section(df, title, limit=8):
 
         lines.append(
             f"• {r['name']}({r['ticker']}) [{r['market']}] 점수 {r['total_score']:.1f}\n"
-            f"  현재가 {fmt_int(r['close'])}원 | 피봇 {fmt_int(r['pivot'])}원 | 손절 {fmt_int(r['stop'])}원 | 리스크 {r['risk_pct']:.1f}%({r['risk_grade']})\n"
-            f"  RS {r['rs_percentile']:.0f} | 52주고점대비 {fmt_pct(r['drawdown_52w_pct'])} | 최근고점대비 {fmt_pct(r['drawdown_pct'])}\n"
+            f"  현재가 {fmt_int(r['close'])}원 | 진입 {fmt_int(r['entry'])}원 | 피봇 {fmt_int(r['pivot'])}원 | 손절 {fmt_int(r['stop'])}원\n"
+            f"  리스크 {r['risk_pct']:.1f}%({r['risk_grade']}) | RS {r['rs_percentile']:.0f}\n"
+            f"  52주고점대비 {fmt_pct(r['drawdown_52w_pct'])} | 최근고점대비 {fmt_pct(r['drawdown_pct'])}\n"
             f"  외국인20일 {foreign_mark} {fmt_krw_eok(r.get('외국인_net', 0))} | 기관20일 {inst_mark} {fmt_krw_eok(r.get('기관합계_net', 0))}\n"
             f"  최근5일: 외국인 {int(r.get('foreign_buy_days_5d', 0))}/5일, 기관 {int(r.get('institution_buy_days_5d', 0))}/5일, 동시 {int(r.get('co_buy_days_5d', 0))}/5일\n"
             f"  거래대금 {fmt_krw_eok(r['avg_turnover_20d'])} | 거래량비율 {volume_ratio_text} | 거래대금비율 {turnover_ratio_text}\n"
@@ -903,7 +930,7 @@ def build_message(result, today_label, end_date, universe_count):
     avoid = result[result["category"] == "AVOID"]
 
     msg = (
-        f"🇰🇷 K-Minervini v2 결과\n"
+        f"🇰🇷 K-Minervini v2.1 결과\n"
         f"기준일: {today_label} / KRX 거래일: {end_date}\n"
         f"------------------------------------\n"
         f"분석대상: 유동성 상위 {universe_count}개\n"
@@ -920,7 +947,7 @@ def build_message(result, today_label, end_date, universe_count):
         f"{format_section(avoid, '⚠️ Avoid / 과열주의', 4)}\n\n"
         f"------------------------------------\n"
         f"※ 투자 추천이 아닌 자동 선별 결과입니다.\n"
-        f"※ v2는 오늘돌파, 최근5일 수급연속성, 과열필터, 리스크등급을 추가했습니다."
+        f"※ v2.1은 미너비니식 리스크 계산, 진입가 기준 손절폭, Avoid 덮어쓰기 완화를 반영했습니다."
     )
 
     return msg
@@ -931,12 +958,12 @@ def main():
         result, today_label, end_date, universe_count = analyze()
         msg = build_message(result, today_label, end_date, universe_count)
         send_telegram_message(msg)
-        print("🎯 K-Minervini v2 완료")
+        print("🎯 K-Minervini v2.1 완료")
 
     except Exception as e:
         print(traceback.format_exc())
         send_telegram_message(
-            f"❌ K-Minervini v2 실행 실패\n"
+            f"❌ K-Minervini v2.1 실행 실패\n"
             f"{e}\n\n"
             f"로그를 GitHub Actions에서 확인하세요."
         )
