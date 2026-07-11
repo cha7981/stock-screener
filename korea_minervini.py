@@ -201,17 +201,30 @@ def date_str(dt):
 
 def get_recent_business_day(max_back=10):
     now = datetime.now(KST)
-    for i in range(max_back):
+    
+    # [핵심 방어 로직] 정규장 개장(오전 9시) 이전인가?
+    # 오전 9시 이전이면 장전 시간외 거래가 있더라도 무조건 오늘(당일)을 건너뛰고 '어제'부터 탐색
+    start_offset = 1 if now.hour < 9 else 0
+    
+    for i in range(start_offset, max_back + start_offset):
         d = now - timedelta(days=i)
         ds = date_str(d)
         try:
             df = stock.get_market_ohlcv_by_ticker(ds, market="KOSPI")
+            
             if df is not None and not df.empty:
-                return ds
+                # 거래대금이 존재하는지 확인 (공휴일/주말 필터링)
+                if "거래대금" in df.columns and df["거래대금"].sum() > 0:
+                    return ds
+                elif "Amount" in df.columns and df["Amount"].sum() > 0:
+                    return ds
+                elif "거래대금" not in df.columns and "Amount" not in df.columns:
+                    return ds
         except Exception:
             pass
         time.sleep(0.1)
     raise RuntimeError("최근 거래일을 찾지 못했습니다.")
+
 
 
 def add_days_ago(base_yyyymmdd, days):
