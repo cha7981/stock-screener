@@ -1,0 +1,77 @@
+name: Minervini Screener V11.1
+
+on:
+  # GitHub 화면에서 수동 실행
+  workflow_dispatch:
+
+  # 미국 증시 영업일 기준 자동 실행
+  schedule:
+    # UTC 22:30
+    # 한국시간 오전 07:30
+    - cron: "30 22 * * 1-5"
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Seoul
+
+      # 계좌 및 위험관리 설정
+      # 예: $100,000 계좌
+      ACCOUNT_SIZE: "100000"
+
+      # 거래 1건당 계좌 손실 허용 비율
+      # 0.005 = 계좌의 0.5%
+      ACCOUNT_RISK_PCT: "0.005"
+
+      # 한 종목 최대 투자 비중
+      # 0.15 = 계좌의 15%
+      MAX_POSITION_PCT: "0.15"
+
+    steps:
+      # 1. GitHub 저장소 코드 가져오기
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Python 설치
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      # 3. 필요한 패키지 설치
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import yfinance, pandas; print('yfinance', yfinance.__version__, 'pandas', pandas.__version__)"
+
+      # 4. 실행 전 Python 문법 검사
+      - name: Check Python syntax
+        run: |
+          python -m py_compile screener.py
+
+      # 5. 미너비니 스크리너 실행
+      - name: Run Minervini screener
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python screener.py
+
+      # 6. 생성된 CSV 결과 업로드
+      # 스크리너가 실패해도 생성된 진단 CSV가 있으면 업로드
+      - name: Upload screener results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minervini-result
+          path: "*.csv"
+          if-no-files-found: warn
+          retention-days: 30
