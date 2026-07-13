@@ -1,8 +1,8 @@
-yfinance
-pandas
+yfinance==1.5.1
+pandas==2.3.3
 numpy
-requests
-lxml
-beautifulsoup4
-html5lib
+requests==2.34.2
+lxml==6.1.1
+beautifulsoup4==4.15.0
+html5lib==1.1
 pykrx
