@@ -1,6 +1,5 @@
 import os
 import time
-import random
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -10,7 +9,7 @@ from pykrx import stock
 # 백테스트 환경 설정
 # ============================================================
 START_BACKTEST = "20230714"  # 3년 전
-END_BACKTEST = "20260714"    # 오늘 (2026년 기준)
+END_BACKTEST = "20260714"    # 오늘 기준
 
 INIT_CASH = 10_000_000       # 초기 자본금 1,000만 원
 MAX_POSITIONS = 5            # 최대 동시 보유 종목 수
@@ -31,9 +30,12 @@ def get_valid_end_date(target_date_str):
     target_date = datetime.strptime(target_date_str, "%Y%m%d")
     for i in range(10):
         check_date = (target_date - timedelta(days=i)).strftime("%Y%m%d")
-        df = stock.get_market_ohlcv_by_ticker(check_date, market="KOSPI")
-        if df is not None and not df.empty:
-            return check_date
+        try:
+            df = stock.get_market_ohlcv_by_ticker(check_date, market="KOSPI")
+            if df is not None and not df.empty:
+                return check_date
+        except Exception:
+            pass
     return target_date_str
 
 # ============================================================
@@ -43,10 +45,13 @@ def get_backtest_universe():
     valid_end_date = get_valid_end_date(END_BACKTEST)
     print(f"📦 백테스트 유니버스 기준일: {valid_end_date}")
     
-    # 수정 완료: get_market_ohlcv_by_ticker 로 올바르게 호출
-    kospi = stock.get_market_ohlcv_by_ticker(valid_end_date, market="KOSPI")
-    kosdaq = stock.get_market_ohlcv_by_ticker(valid_end_date, market="KOSDAQ")
-    snap = pd.concat([kospi, kosdaq])
+    try:
+        kospi = stock.get_market_ohlcv_by_ticker(valid_end_date, market="KOSPI")
+        kosdaq = stock.get_market_ohlcv_by_ticker(valid_end_date, market="KOSDAQ")
+        snap = pd.concat([kospi, kosdaq])
+    except Exception as e:
+        print(f"⚠️ 마켓 스냅샷 로드 실패: {e}")
+        return []
     
     if snap.empty:
         print("⚠️ 유니버스 데이터를 불러오지 못했습니다.")
@@ -63,10 +68,15 @@ def get_backtest_universe():
     return tickers
 
 # ============================================================
-# 2. 지표 계산 엔진
+# 2. 지표 계산 엔진 (KeyError 방지 보완)
 # ============================================================
 def calculate_historical_indicators(df):
     df = df.copy()
+    
+    # [오류 수정] pykrx 기간 조회에 거래대금이 없는 경우 종가*거래량으로 자체 계산
+    if "Turnover" not in df.columns or df["Turnover"].dropna().empty:
+        df["Turnover"] = df["Close"] * df["Volume"]
+        
     df["MA10"] = df["Close"].rolling(10).mean()
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA60"] = df["Close"].rolling(60).mean()
@@ -93,19 +103,21 @@ def run_backtest():
 
     all_data = {}
     
-    print("📥 종목별 3년치 데이터 로드 중 (약 2~3분 소요)...")
+    print("📥 종목별 3년치 데이터 로드 및 지표 연산 중...")
     for idx, t in enumerate(tickers):
         try:
             df = stock.get_market_ohlcv_by_date(START_BACKTEST, END_BACKTEST, t)
-            if df is not None and len(df) >= 150:
+            if df is not None and len(df) >= 100:
                 df = df.rename(columns={"시가":"Open", "고가":"High", "저가":"Low", "종가":"Close", "거래량":"Volume", "거래대금":"Turnover"})
                 all_data[t] = calculate_historical_indicators(df)
-        except Exception:
+        except Exception as e:
+            # 에러 추적용 파악 문구 (필요 시 주석 해제)
+            # print(f"Ticker {t} 소스 에러: {e}")
             pass
         time.sleep(0.05)
 
     if not all_data:
-        print("❌ 데이터 로드 실패")
+        print("❌ 데이터 로드 실패: 모든 종목의 데이터 가공에 실패했습니다.")
         return
     
     trading_days = sorted(list(all_data[list(all_data.keys())[0]].index))
@@ -115,7 +127,7 @@ def run_backtest():
     portfolio = []  
     history = []
     
-    print(f"🚀 시뮬레이션 시작 ({len(trading_days)} 거래일)")
+    print(f"🚀 시뮬레이션 가동 시작 ({len(trading_days)} 거래일)")
 
     for current_day in trading_days:
         # A. 보유 종목 매도 조건 체크
@@ -177,10 +189,14 @@ def run_backtest():
                 # 피봇 돌파 시그널
                 pivot = sub_df["High"].iloc[-20:-1].max()
                 if last["Close"] >= pivot and last["Volume"] > last["VolMA20"] * 1.3:
-                    stop_loss = max(sub_df["Low"].iloc[-5:], default=last["Close"] * 0.95)
+                    # [논리오류 수정] 손절선은 최근 5일간의 '최저가' 지지선으로 잡아야 하므로 min 사용
+                    stop_loss = min(sub_df["Low"].iloc[-5:]) if len(sub_df) >= 5 else last["Close"] * 0.95
+                    if stop_loss >= last["Close"]:
+                        stop_loss = last["Close"] * 0.95
+                        
                     risk_pct = (last["Close"] - stop_loss) / last["Close"]
                     
-                    if 0.02 <= risk_pct <= 0.07:
+                    if 0.02 <= risk_pct <= 0.08:
                         candidates.append({
                             "ticker": t,
                             "price": last["Close"],
@@ -217,7 +233,7 @@ def run_backtest():
         win_rate = (df_hist["pnl"] > 0).sum() / len(df_hist) * 100
         print(f"• 총 매매 횟수: {len(df_hist)} 회")
         print(f"• 매매 승률: {win_rate:.1f}%")
-        print(f"• 평균 1회 수익률: {df_hist['pnl'].mean() * 100:.2f}%")
+        print(f"• 평균 1회 매매 수익률: {df_hist['pnl'].mean() * 100:.2f}%")
         print(f"\n[청산 유형별 횟수]\n{df_hist['reason'].value_counts().to_string()}")
     print("="*50)
 
