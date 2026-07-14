@@ -1,11 +1,8 @@
-name: Minervini Screener Final V11.2
+name: Minervini Screener V11.3
 
 on:
-  # GitHub Actions 화면에서 수동 실행
   workflow_dispatch:
 
-  # 월요일~금요일 한국시간 오전 7시 30분 자동 실행
-  # GitHub Actions cron은 UTC 기준이므로 22:30 UTC로 설정
   schedule:
     - cron: "30 22 * * 1-5"
 
@@ -13,53 +10,48 @@ jobs:
   run-screener:
     runs-on: ubuntu-24.04
 
+    timeout-minutes: 45
+
     permissions:
       contents: read
 
     env:
-      # Python 로그를 실시간으로 표시
       PYTHONUNBUFFERED: "1"
-
-      # 실행 환경 시간대
       TZ: Asia/Seoul
 
-      # 계좌 크기: 기본 100,000달러
       ACCOUNT_SIZE: "100000"
-
-      # 거래당 최대 허용 손실: 계좌의 0.5%
       ACCOUNT_RISK_PCT: "0.005"
-
-      # 종목당 최대 투자 비중: 계좌의 15%
       MAX_POSITION_PCT: "0.15"
 
-      # 텔레그램 메시지에 표시할 상위 후보 개수
       TOP_TELEGRAM_COUNT: "10"
 
     steps:
-      # 1. GitHub 저장소 파일 가져오기
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Python 3.10 설치
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.10"
           cache: pip
 
-      # 3. Python 패키지 설치
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -c "import yfinance, pandas; print('yfinance', yfinance.__version__, 'pandas', pandas.__version__)"
 
-      # 4. screener.py 문법 검사
+          python -c "
+          import yfinance
+          import pandas
+
+          print('yfinance', yfinance.__version__)
+          print('pandas', pandas.__version__)
+          "
+
       - name: Check Python syntax
         run: |
           python -m py_compile screener.py
 
-      # 5. 미너비니 스크리너 실행
       - name: Run Minervini screener
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -67,15 +59,16 @@ jobs:
         run: |
           python screener.py
 
-      # 6. 생성된 CSV와 TXT 결과를 GitHub Artifact로 업로드
-      # 스크리너 실행 실패 시에도 생성된 진단 파일을 업로드
-      - name: Upload results
+      - name: Upload results and error logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: minervini-result
+
           path: |
             *.csv
             *.txt
+            screener_error_log.txt
+
           if-no-files-found: warn
           retention-days: 30
